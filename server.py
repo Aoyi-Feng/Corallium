@@ -847,17 +847,33 @@ class Store:
             # §3.4.1 — the gate that stops the graph from spreading sideways.
             # It only runs for propositions: a review points at its claim by
             # construction, and a task is an obligation, not a finding.
+            #
+            # v0.1.18: a parent edge is NOT a pass. The old rule ("parents ⇒ 201")
+            # was exploited as a free channel — one author wrote the same claim
+            # twice with rel=extends, similarity 1.00, and nothing objected.
+            # Parented propositions are still gated, but at 0.90: `extends`
+            # legitimately restates part of its father, while a near-verbatim
+            # restatement adds no information at either threshold.
             gateable = ntype in ("claim", "anomaly", "question", "decision")
-            if gateable and not parents:
+            if gateable:
+                thr = 0.90 if parents else 0.62
                 cand = self._candidates(p, o)
+                for x in cand:
+                    x["similar_to_parent"] = x["id"] in parents
                 top = cand[0] if cand else None
-                if top and top["similarity"] >= 0.62 and not payload.get("force"):
-                    return {"conflict": "similar", "candidates": cand,
-                            "hint": "link it (rel=extends|supersedes, parents=[id]) "
-                                    "or pass force=true with why_new"}
-                if top and top["similarity"] >= 0.62 and not (payload.get("why_new") or "").strip():
-                    raise ValueError("force=true needs a non-empty why_new: "
-                                     "say how this differs from " + top["id"])
+                if top and top["similarity"] >= thr:
+                    if not payload.get("force"):
+                        hint = ("this restates an existing node almost word for word; "
+                                "a parent edge does not exempt it — pass force=true with "
+                                "why_new saying what it adds, or rel=supersedes"
+                                if parents else
+                                "link it (rel=extends|supersedes, parents=[id]) "
+                                "or pass force=true with why_new")
+                        return {"conflict": "similar", "candidates": cand,
+                                "threshold": thr, "hint": hint}
+                    if not (payload.get("why_new") or "").strip():
+                        raise ValueError("force=true needs a non-empty why_new: "
+                                         "say how this differs from " + top["id"])
 
             seq = int(c.execute("SELECT coalesce(max(seq),0) FROM nodes").fetchone()[0]) + 1
             node = {

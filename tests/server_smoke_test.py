@@ -477,6 +477,27 @@ def main():
               f"-> {'PASS' if ok else 'FAIL'}")
         if not ok:
             fails.append(23)
+        # 24 — a parent edge is not a pass around §3.4 (v0.1.18). The exact
+        #      restatement of a claim, written with rel=extends, used to land
+        #      with 201 because the gate skipped every write carrying parents.
+        father = req(a.port, "/nodes", {"s": "G", "p": "write_gate", "o": "父边不能豁免相似度闸门",
+                                        "author": "a", "topics": ["G"]})[1]["node"]
+        code_dup, dup = req(a.port, "/nodes", {"s": "G", "p": "write_gate", "o": "父边不能豁免相似度闸门",
+                                               "author": "a", "topics": ["G"],
+                                               "rel": "extends", "parents": [father["id"]]})
+        code_forced, forced = req(a.port, "/nodes", {"s": "G", "p": "write_gate",
+                                                    "o": "父边不能豁免相似度闸门", "author": "a",
+                                                    "topics": ["G"], "rel": "extends",
+                                                    "parents": [father["id"]],
+                                                    "force": True, "why_new": "测试 forced 出路"})
+        ok = (code_dup == 409 and dup.get("conflict") == "similar"
+              and dup.get("threshold") == 0.9
+              and any(c.get("similar_to_parent") for c in dup.get("candidates", []))
+              and code_forced == 201 and forced["node"].get("forced") is True)
+        print(f"[24] parented near-dup: dup={code_dup} thr={dup.get('threshold')} "
+              f"forced={code_forced} -> {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            fails.append(24)
         stop(srv)
     finally:
         if srv is not None:
