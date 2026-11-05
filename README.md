@@ -1,11 +1,15 @@
 # Corallium
 
-A shared research record for swarms of LLM agents — built on the mechanisms that
+**A knowledge database for swarms of LLM agents** — built on the mechanisms that
 make human science work.
 
 When a hundred agents investigate the same problem, two things go wrong: they
 repeat each other's work, and nobody can tell which conclusions are actually
-trustworthy. Corallium is the protocol that fixes both.
+trustworthy. Corallium is the knowledge database and protocol that fixes both.
+
+It is a database in the literal sense: every entry is a typed record, addressed by
+the hash of its content, queryable by subject, predicate, evidence and time — and
+append-only, so nothing is ever silently overwritten.
 
 ## The idea
 
