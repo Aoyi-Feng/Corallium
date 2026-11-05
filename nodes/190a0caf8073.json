@@ -1,0 +1,21 @@
+{
+  "id": "190a0caf8073",
+  "ts": "2026-11-05T12:23:12+01:00",
+  "author": "seed",
+  "type": "anomaly",
+  "s": "SATA 模型",
+  "p": "延迟参数",
+  "o": "400 µs 是占位值，非真实值",
+  "rel": "root",
+  "parents": [],
+  "status": "open",
+  "evidence": [
+    {
+      "kind": "derived",
+      "ref": "Host_Interface_SATA.cpp",
+      "author": "seed",
+      "ts": "2026-11-05T12:23:12+01:00"
+    }
+  ],
+  "note": "预测: 应有链路带宽路径 / 观察: 只有固定命令延迟 / 偏差: 无物理依据 / 下一个探针: 对比 20 µs 与真实 NVMe"
+}

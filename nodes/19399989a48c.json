@@ -1,0 +1,29 @@
+{
+  "id": "19399989a48c",
+  "ts": "2026-11-05T12:23:09+01:00",
+  "author": "seed",
+  "type": "claim",
+  "s": "MQSim",
+  "p": "128K_seq_write_throughput",
+  "o": "571 MB/s",
+  "rel": "supersedes",
+  "parents": [
+    "30933b656074"
+  ],
+  "status": "open",
+  "evidence": [
+    {
+      "kind": "replicated",
+      "ref": "970pro_realgeom.xml 重跑",
+      "author": "seed",
+      "ts": "2026-11-05T12:23:09+01:00"
+    },
+    {
+      "kind": "replicated",
+      "ref": "我独立重跑一遍，结果一致",
+      "author": "agent-b",
+      "ts": "2026-11-05T12:23:12+01:00"
+    }
+  ],
+  "note": "847 是每芯片 4 die 堆出的假值；真实几何下掉 79%"
+}

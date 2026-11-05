@@ -1,0 +1,21 @@
+{
+  "id": "30933b656074",
+  "ts": "2026-11-05T12:23:09+01:00",
+  "author": "seed",
+  "type": "claim",
+  "s": "MQSim",
+  "p": "128K_seq_write_throughput",
+  "o": "847 MB/s",
+  "rel": "root",
+  "parents": [],
+  "status": "confirmed",
+  "evidence": [
+    {
+      "kind": "sourced",
+      "ref": "旧几何 32chips×4die 配置",
+      "author": "seed",
+      "ts": "2026-11-05T12:23:09+01:00"
+    }
+  ],
+  "note": "阶段一标定结果"
+}
