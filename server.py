@@ -92,6 +92,10 @@ class Store:
         """Derived index is disposable: rebuild from node files on start."""
         c = self._conn()
         self._init_schema(c)
+        try:
+            c.execute("DELETE FROM nodes_fts")  # rebuild means rebuild, not append
+        except sqlite3.OperationalError:
+            pass
         rows = list(self.nodes_dir.glob("*.json"))
         for f in rows:
             try:
@@ -200,7 +204,8 @@ class Store:
         c.close()
         return out
 
-    def find(self, q: str, limit: int = 5, root: str = "") -> tuple[list[dict], int]:
+    def find(self, q: str, limit: int = 5, root: str = "",
+             order: str = "recent") -> tuple[list[dict], int]:
         """Returns (hits, outside_count). outside = matched but filtered by --root."""
         c = self._conn()
         q = (q or "").strip()
@@ -216,6 +221,7 @@ class Store:
                     "SELECT nid FROM nodes_fts WHERE nodes_fts MATCH ? LIMIT ?",
                     ('"' + q.replace('"', '""') + '"', max(limit * 4, 20)),
                 ).fetchall()]
+                ids = list(dict.fromkeys(ids))  # FTS rows are per-insert, not per-id
                 if ids:
                     marks = ",".join("?" * len(ids))
                     got = {}
@@ -251,6 +257,10 @@ class Store:
             keep = [n for n in out if root in (n.get("topics") or [])]
             outside = len(out) - len(keep)
             out = keep
+        if order == "significance":
+            out.sort(key=lambda n: (n.get("significance", 3), n.get("score", 0)), reverse=True)
+        elif order == "score":
+            out.sort(key=lambda n: n.get("score", 0), reverse=True)
         return out[:limit], outside
 
     def derive_status(self, node: dict, all_nodes: list[dict]) -> str:
@@ -280,6 +290,10 @@ class Store:
         alln = [json.loads(b) for (b,) in c.execute("SELECT body FROM nodes").fetchall()]
         c.close()
         scores = self._scores(alln)
+        deps: dict[str, int] = {}
+        for n in alln:
+            for p_ in (n.get("parents") or []):
+                deps[p_] = deps.get(p_, 0) + 1
         out = []
         for n in nodes:
             m = dict(n)
@@ -288,6 +302,8 @@ class Store:
                 sc = scores.get(n["id"], {"score": 0, "votes": 0})
                 m["score"] = sc["score"]
                 m["votes"] = sc["votes"]
+                m["significance"] = n.get("significance", 3)
+                m["dependents"] = deps.get(n["id"], 0)
             out.append(m)
         return out
 
@@ -421,6 +437,9 @@ class Store:
                 "volatility": payload.get("volatility", "static"),
                 "topics": payload.get("topics") or [],
                 "attempts": payload.get("attempts", 1),
+                # declared, not voted: significance is how much it would matter
+                # if true, which is a different axis from whether it is true.
+                "significance": max(1, min(5, int(payload.get("significance", 3) or 3))),
                 "note": payload.get("note", ""),
             }
             if payload.get("method"):
@@ -572,7 +591,8 @@ def make_handler(corals: dict, read_token: str, write_token: str, default: str |
                     return self._send(404 if "error" in r else 200, r)
                 if ep == "/find":
                     hits, outside = store.find(q.get("q", [""])[0],
-                                               root=(q.get("root", [""])[0] or ""))
+                                               root=(q.get("root", [""])[0] or ""),
+                                               order=(q.get("sort", ["recent"])[0] or "recent"))
                     return self._send(200, {"hits": hits, "outside": outside})
                 return self._send(404, {"error": "not found"})
             except Exception as e:

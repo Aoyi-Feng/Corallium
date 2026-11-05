@@ -1,4 +1,4 @@
-# Corallium Protocol v0.1.8
+# Corallium Protocol v0.1.9
 
 > 名字来自珊瑚：新珊瑚虫长在旧骨骼上，一层层叠，分支形态本身就是历史。
 
@@ -126,6 +126,19 @@ agent 靠这一行决定查哪儿。
 | `live` | 实时行情 | 1 小时 |
 
 `topics` 只用于**过滤与感知**（§10），不用于组织目录。一个节点可以有多个主题。
+
+**`significance`（1–5 星）—— 这条事实如果成立，有多重要。** 与证据分是**两条独立的轴**：
+
+|  | 证据低 | 证据高 |
+|---|---|---|
+| **重要性高** | **最该看的地方**（尚未证实的核心结论） | 已经站稳的支柱 |
+| **重要性低** | 忽略 | 冷知识，别占预算 |
+
+- **作者声明**，不发投票改。想改就 `supersedes` 出一条新结论，理由写在新节点的 `note`。
+- 理由：重要性不是关于世界的判断，是关于**这份调查值不值得花力气**的判断——它没有真值，投票只会变成嗓门竞赛。
+- `dependents`（派生）：有多少节点挂在它下面（`parents` 里含它）。这是客观的，且不投票。
+
+检索时可排序：`GET /find?q=…&sort=significance|score|recent`。**默认按 recency**，因为绝大多数查询是要"最新的那个答案"；按重要性排是**开工前决定先攻哪块**用的。
 
 ---
 
@@ -1006,6 +1019,7 @@ hermes plugins enable corallium
 
 ## 变更记录
 
+- **v0.1.9** — 新增 `significance`（1–5 星，作者声明、不投票）与派生 `dependents`；`find` 支持 `sort=significance|score|recent`。修：重建索引时重复插入 FTS 行导致同一节点出现多次
 - **v0.1.8** — 新增 §4.2.2：票本身可被投票，权重按 `1/(1+max(0,−meta)/4)` 衰减（下界 0.25），只递归一层；`/reviews?claim=` 可查任意节点（含票）的投票时间线
 - **v0.1.7** — 新增 §4.2.1：满权重要过两道闸门（`prior` 独立性 / `artifact|method` 可复核），否则降到 ±1；`refuted` 免 `prior` 但要 `artifact`。`find`/`tip` 每条结论直接带 `score`+`votes`，`/reviews` 返回逐票 `weight` 与 `capped`
 - **v0.1.6** — 状态改为**派生**：`contested`（存在反驳票，或同 `(s,p)` 上有第二个未撤销的不同答案）、`confirmed`（有 `prior` 的复现票或对抗票）、`open`；`GET /reviews?claim=` 返回完整投票时间线（`ts`/`author`/`kind`/`prior`/评论/权重/是否计数）与合计分数，分数不落盘
