@@ -229,10 +229,11 @@ def main():
                                                "parents": ["000000000000"]})
         rootn = req(a.port, "/nodes", {"s": "P", "p": "anchor", "o": "anchor value",
                                        "author": "a", "topics": ["P"]})[1]["node"]
-        code_ok = req(a.port, "/nodes", {"s": "P", "p": "child", "o": "x", "author": "a",
-                                         "rel": "extends", "parents": [rootn["id"]]})[0]
-        ok = code_bad == 400 and code_ok == 201
-        print(f"[11] parent must exist: unknown={code_bad} real={code_ok} -> {'PASS' if ok else 'FAIL'}")
+        code_ok, okbody = req(a.port, "/nodes", {"s": "P", "p": "child", "o": "x", "author": "a",
+                                                 "rel": "extends", "parents": [rootn["id"]]})
+        ok = code_bad == 400 and code_ok == 201 and "linked_to" in okbody
+        print(f"[11] parent must exist: unknown={code_bad} real={code_ok} "
+              f"linked_to={'linked_to' in okbody} -> {'PASS' if ok else 'FAIL'}")
         if not ok:
             fails.append(11)
 

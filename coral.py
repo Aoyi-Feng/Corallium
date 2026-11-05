@@ -449,7 +449,9 @@ def cmd_tip(a) -> int:
     tips.sort(key=lambda n: n.get("seq") or 0, reverse=True)
     for n in tips[: a.limit]:
         print_node(n)
-        print(f"    {st(n)} · {n.get('votes', 0)} vote(s) · {n.get('dependents', 0)} dependent(s)")
+        tried = int(n.get("attempts") or 1)
+        print(f"    {st(n)} · {n.get('votes', 0)} vote(s) · {n.get('dependents', 0)} dependent(s)"
+              + (f" · tried {tried}" if tried > 1 else ""))
     if any(st(n) == "contested" for n in tips):
         print(f"!! {sum(1 for n in tips if st(n)=='contested')} contested — unresolved disagreement")
     print(f"{min(len(tips), a.limit)} tip(s)")
