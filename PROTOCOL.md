@@ -1,4 +1,4 @@
-# Corallium Protocol v0.1.4
+# Corallium Protocol v0.1.5
 
 > 名字来自珊瑚：新珊瑚虫长在旧骨骼上，一层层叠，分支形态本身就是历史。
 
@@ -725,6 +725,31 @@ COMMIT;
 
 传输加密：Tailscale 内网是 WireGuard，够用；公网暴露才需要 TLS。
 
+### 13.9 一个服务，多个珊瑚
+
+一个进程可以同时服务多个珊瑚，按路径前缀区分：
+
+```
+http://host:8731/c/mqsim/find?q=571
+http://host:8731/c/trading/since?cursor=41
+```
+
+- `GET /health` 与 `GET /corals` 返回全部珊瑚及各自的 `max_seq`。
+- 只有一个珊瑚时，裸路径（`/find`）照常可用，客户端不需要知道前缀。
+- **珊瑚之间完全隔离**：不同的 `nodes/`、不同的 `seq`、不同的 `claims.json`。跨珊瑚引用只能靠 URL 写进 `note`，不是一条边。
+- 珊瑚不存在 → `404` 并在响应里列出所有可用名字。**报错必须告诉 agent 去哪儿**，否则它会以为库是空的。
+
+`~/corals/registry.yaml` 每珊瑚一行（名字: 一句话说明），路径默认 `~/corals/<name>/`：
+
+```yaml
+mqsim: 仿真器、SSD、存储栈
+trading: 动量模型、组合、因子
+```
+
+**为什么合并到一个进程**：一个端口、一个 systemd 单元、一套 token。分开跑意味着每加一个知识域就多一个要记得启动的服务——而"服务没起来"是这类系统唯一真正的故障模式（§13.4）。
+
+租约（`claims.json`）**不属于派生数据**：`index.db` 可以随便删，租约不行。删掉索引只会重建，删掉租约会让两个 agent 同时开工。
+
 ---
 
 ## 14. 撤销与清除
@@ -934,6 +959,7 @@ hermes plugins enable corallium
 
 ## 变更记录
 
+- **v0.1.5** — 新增 §13.9：一个服务进程托管多个珊瑚（`/c/<name>/` 前缀），`registry.yaml` 每珊瑚一行；明确租约 `claims.json` 不属于派生数据，删 `index.db` 不得丢租约
 - **v0.1.4** — 独立性判据改为**上下文**而非身份，新增 `prior` 先承诺机制（无 `prior` 的 `replicated` 降权至 1）；新增 §0.1 一个珊瑚一个知识域；新增 §11.5 根约束与 §11.6 越界信号；新增 §13.7 客户端无关、§13.8 读写分级；新增 §17 部署与客户端（自建/远程/降级、不自动拉起）
 
 - **v0.1.3** — 明确方法论：模拟科学共同体的研究路径（§0）；新增 `adversarial` 证据类型（权重 4）与 challenger 角色（§4.5）；`confirmed` 分为 `unchallenged`/`challenged` 两级（§4.4）；新增 `method` 字段，无 `method` 不得被复现性投票（§4.5）；新增 `attempts` 防多重比较（§4.6）；新增 `suspect` 状态与撤稿级联（§14.4）

@@ -67,6 +67,25 @@ Two forms, one protocol:
 - **Self-hosted** — `coral serve --port 8731`, data in `~/corals/<name>/`
 - **Remote** — point the client at a URL + token, store nothing locally
 
+One process can serve several corals, addressed by prefix:
+
+```bash
+python3 server.py --registry ~/corals/registry.yaml --port 8731
+#   /c/mqsim/find?q=571
+#   /c/trading/since?cursor=41
+#   /health          → every coral and its max_seq
+```
+
+A coral directory is small enough to read in one breath:
+
+```
+~/corals/mqsim/
+├── nodes/<id>.json     # the truth: one immutable file per proposition
+├── claims.json         # live leases — must survive an index rebuild
+├── index.db            # derived (SQLite FTS5 trigram); delete it freely
+└── .git/
+```
+
 If the server is unreachable, clients degrade to reading `nodes/` directly. They never
 silently drop a publish.
 

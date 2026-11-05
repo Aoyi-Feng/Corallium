@@ -41,12 +41,14 @@ class Store:
         self.nodes_dir = root / "nodes"
         self.nodes_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = root / "index.db"
+        self.claims_path = root / "claims.json"  # leases must survive rm index.db
         self._q: Queue = Queue()
         self._ready = threading.Event()
         self._thread = threading.Thread(target=self._writer, daemon=True)
         self._thread.start()
         self._ready.wait(10)
         self._rebuild()
+        self._load_claims()
 
     # -- db ---------------------------------------------------------------
     def _conn(self) -> sqlite3.Connection:
@@ -107,6 +109,43 @@ class Store:
         parts = [str(n.get(k) or "") for k in ("s", "p", "o", "note", "type", "author")]
         parts += [str(t) for t in (n.get("topics") or [])]
         return " ".join(p for p in parts if p)
+
+    def _load_claims(self) -> None:
+        """Leases live in claims.json, not only in the derived index.
+
+        `rm index.db*` is documented as harmless; if leases existed only in the
+        database, that harmless delete would silently let two agents claim the
+        same question. Fail-open is acceptable for an expired lease, never for
+        a live one.
+        """
+        if not self.claims_path.exists():
+            return
+        try:
+            items = json.loads(self.claims_path.read_text())
+        except Exception:
+            return
+        c = self._conn()
+        for it in items:
+            c.execute(
+                "INSERT INTO claims VALUES (?,?,?,?,?,?) ON CONFLICT(task_key) DO UPDATE SET "
+                "author=excluded.author, lease_until=excluded.lease_until, status=excluded.status",
+                (it["task_key"], it.get("question", ""), it.get("author", "unknown"),
+                 it.get("lease_until", 0), it.get("status", "claimed"), it.get("ts", "")),
+            )
+        c.commit()
+        c.close()
+
+    def _save_claims(self) -> None:
+        c = self._conn()
+        rows = c.execute(
+            "SELECT task_key, question, author, lease_until, status, ts FROM claims"
+        ).fetchall()
+        c.close()
+        items = [dict(zip(("task_key", "question", "author", "lease_until", "status", "ts"), r))
+                 for r in rows]
+        tmp = self.claims_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2))
+        os.replace(tmp, self.claims_path)
 
     def _fts_put(self, c: sqlite3.Connection, n: dict) -> None:
         try:
@@ -296,7 +335,10 @@ class Store:
             )
             return {"acquired": True, "task_key": key, "lease_until": now + ttl_min * 60}
 
-        return self._run(job)
+        r = self._run(job)
+        if r.get("acquired"):
+            self._save_claims()  # lease must survive an index wipe
+        return r
 
     def reply(self, claim_id: str, payload: dict) -> dict:
         merged = dict(payload)
@@ -308,7 +350,10 @@ class Store:
 
 
 # ── http ───────────────────────────────────────────────────────────────────
-def make_handler(store: Store, read_token: str, write_token: str):
+def make_handler(corals: dict, read_token: str, write_token: str, default: str | None):
+    """One process, many corals. `/c/<name>/<endpoint>` addresses them explicitly;
+    bare `/<endpoint>` goes to the default coral so a single-coral install needs
+    no prefix."""
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -333,21 +378,63 @@ def make_handler(store: Store, read_token: str, write_token: str):
                 return False
             return True
 
+        def _resolve(self, path: str):
+            """-> (store, endpoint, coral_name) or (None, None, None) if unknown."""
+            parts = [p for p in path.split("/") if p]
+            if parts and parts[0] == "c":
+                if len(parts) < 2:
+                    return None, None, None
+                name = parts[1]
+                if name not in corals:
+                    self._send(404, {"error": f"unknown coral '{name}'",
+                                     "corals": sorted(corals)})
+                    return None, None, None
+                return corals[name], "/" + "/".join(parts[2:]), name
+            if default is None:
+                self._send(400, {"error": "no default coral; use /c/<name>/...",
+                                 "corals": sorted(corals)})
+                return None, None, None
+            return corals[default], path, default
+
         def do_GET(self):
-            if not self._auth(write=False):
-                return
             u = urlparse(self.path)
             q = parse_qs(u.query)
+            # /health stays unauthenticated: systemd and monitors probe it, and
+            # it leaks nothing but coral names and sequence numbers.
+            if u.path == "/health":
+                meta = {n: {"path": str(s.root), "max_seq": s.max_seq()}
+                        for n, s in corals.items()}
+                return self._send(200, {
+                    "ok": True, "default": default,
+                    "max_seq": meta[default]["max_seq"] if default else 0,
+                    "corals": meta,
+                })
+            if not self._auth(write=False):
+                return
             try:
-                if u.path == "/health":
-                    return self._send(200, {"ok": True, "max_seq": store.max_seq()})
-                if u.path == "/since":
+                if u.path == "/corals":
+                    meta = {n: {"path": str(s.root), "max_seq": s.max_seq()}
+                            for n, s in corals.items()}
+                    return self._send(200, {
+                        "ok": True,
+                        "default": default,
+                        # top-level max_seq keeps single-coral clients working
+                        "max_seq": meta[default]["max_seq"] if default else 0,
+                        "corals": meta,
+                    })
+                store, ep, name = self._resolve(u.path)
+                if store is None:
+                    return
+                if ep == "/health":
+                    return self._send(200, {"ok": True, "coral": name,
+                                            "max_seq": store.max_seq()})
+                if ep == "/since":
                     cursor = int(q.get("cursor", ["0"])[0] or 0)
                     topics = [t for t in (q.get("topics", [""])[0] or "").split(",") if t]
                     return self._send(200, {"nodes": store.since(cursor, topics)})
-                if u.path == "/tip":
+                if ep == "/tip":
                     return self._send(200, {"tips": store.tip(q.get("topic", [""])[0])})
-                if u.path == "/find":
+                if ep == "/find":
                     hits, outside = store.find(q.get("q", [""])[0],
                                                root=(q.get("root", [""])[0] or ""))
                     return self._send(200, {"hits": hits, "outside": outside})
@@ -362,15 +449,18 @@ def make_handler(store: Store, read_token: str, write_token: str):
             try:
                 ln = int(self.headers.get("Content-Length") or 0)
                 payload = json.loads(self.rfile.read(ln) or b"{}")
-                if u.path == "/nodes":
+                store, ep, name = self._resolve(u.path)
+                if store is None:
+                    return
+                if ep == "/nodes":
                     r = store.add_node(payload)
                     return self._send(201 if r["created"] else 200, r)
-                if u.path == "/claims":
+                if ep == "/claims":
                     return self._send(200, store.claim(
                         payload.get("question", ""), payload.get("author", "unknown"),
                         int(payload.get("ttl", 30))))
-                if u.path.startswith("/nodes/") and u.path.endswith("/replies"):
-                    nid = u.path[len("/nodes/"):-len("/replies")]
+                if ep.startswith("/nodes/") and ep.endswith("/replies"):
+                    nid = ep[len("/nodes/"):-len("/replies")]
                     return self._send(201, store.reply(nid, payload))
                 return self._send(404, {"error": "not found"})
             except Exception as e:
@@ -379,23 +469,78 @@ def make_handler(store: Store, read_token: str, write_token: str):
     return H
 
 
+def load_registry(path: Path) -> dict[str, str]:
+    """registry.yaml, deliberately parsed with a 10-line reader.
+
+        mqsim: 仿真器、SSD、存储栈
+        trading: 动量模型、组合、因子
+
+    Paths resolve relative to ~/corals/. A JSON file is also accepted.
+    """
+    text = path.read_text()
+    if text.lstrip().startswith("{") or text.lstrip().startswith("["):
+        data = json.loads(text)
+        if isinstance(data, list):
+            return {d["name"]: d["path"] for d in data}
+        return {k: (v if isinstance(v, str) else v.get("path")) for k, v in data.items()}
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line or ":" not in line:
+            continue
+        name, val = line.split(":", 1)
+        val = val.strip()
+        first = val.split()[0] if val else ""
+        # a bare description (no path-looking token) means ~/corals/<name>
+        path_str = first if ("/" in first or first.startswith("~")) else name.strip()
+        base = Path(path_str).expanduser()
+        if not base.is_absolute():
+            base = path.parent / path_str
+        out[name.strip()] = str(base)
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="coral-serve")
-    ap.add_argument("--root", default=str(Path.home() / "corals" / "mqsim"))
+    ap.add_argument("--root", default="", help="single-coral mode: one data directory")
+    ap.add_argument("--coral", action="append", default=[],
+                    metavar="NAME=PATH", help="add a coral (repeatable)")
+    ap.add_argument("--registry", default="", help="registry.yaml listing several corals")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--bind", default="0.0.0.0")
     a = ap.parse_args()
 
-    root = Path(a.root).expanduser()
-    root.mkdir(parents=True, exist_ok=True)
+    roots: dict[str, Path] = {}
+    if a.registry:
+        reg = Path(a.registry).expanduser()
+        roots.update({n: Path(p).expanduser() for n, p in load_registry(reg).items()})
+    for spec in a.coral:
+        if "=" not in spec:
+            ap.error(f"--coral wants NAME=PATH, got {spec!r}")
+        n, p = spec.split("=", 1)
+        roots[n.strip()] = Path(p).expanduser()
+    if a.root:
+        roots["default"] = Path(a.root).expanduser()
+    if not roots:
+        roots["default"] = Path.home() / "corals" / "mqsim"
+
     read_token = os.environ.get("CORALLIUM_READ_TOKEN", "")
     write_token = os.environ.get("CORALLIUM_WRITE_TOKEN", "")
 
-    store = Store(root)
-    srv = ThreadingHTTPServer((a.bind, a.port), make_handler(store, read_token, write_token))
-    print(f"corallium serving {root} on {a.bind}:{a.port} "
-          f"(read_token={'set' if read_token else 'open'}, "
-          f"write_token={'set' if write_token else 'open'})", flush=True)
+    corals: dict[str, Store] = {}
+    for name, root in roots.items():
+        root.mkdir(parents=True, exist_ok=True)
+        corals[name] = Store(root)
+
+    default = "default" if "default" in corals else (next(iter(corals)) if len(corals) == 1 else None)
+
+    srv = ThreadingHTTPServer((a.bind, a.port),
+                              make_handler(corals, read_token, write_token, default))
+    print(f"corallium on {a.bind}:{a.port} — {len(corals)} coral(s), default={default}", flush=True)
+    for n, s in corals.items():
+        print(f"  /c/{n}  ->  {s.root}  (max_seq={s.max_seq()})", flush=True)
+    print(f"  tokens: read={'set' if read_token else 'open'} "
+          f"write={'set' if write_token else 'open'}", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
