@@ -171,15 +171,25 @@ class Store:
         c.commit()
         c.close()
 
-    def _save_claims(self) -> None:
-        c = self._conn()
+    def _save_claims(self, c: sqlite3.Connection | None = None) -> None:
+        """Call it with the writer's own connection: a fresh connection cannot see
+        an uncommitted INSERT, so saving from outside the transaction writes an
+        empty file and the lease dies on the next restart."""
+        own = c is None
+        if own:
+            c = self._conn()
         rows = c.execute(
             "SELECT task_key, question, author, lease_until, status, ts FROM claims"
         ).fetchall()
-        c.close()
+        if own:
+            c.close()
         items = [dict(zip(("task_key", "question", "author", "lease_until", "status", "ts"), r))
                  for r in rows]
-        tmp = self.claims_path.with_suffix(".json.tmp")
+        # Unique temp name: two threads saving at once used to race on a single
+        # `claims.json.tmp`, one rename won, the other raised FileNotFoundError
+        # and returned 500 — while the lease had already been taken in SQLite.
+        tmp = self.claims_path.with_name(
+            f"claims.{os.getpid()}.{threading.get_ident()}.tmp")
         tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2))
         os.replace(tmp, self.claims_path)
 
@@ -477,9 +487,23 @@ class Store:
         return {"node": target, "score": sc["score"], "tally": tally, "votes": sc["detail"]}
 
     def annotate(self, nodes: list[dict]) -> list[dict]:
+        """Fill in everything that is derived: status, score, votes, dependents.
+
+        This re-reads every node body on every query: 28 ms at 5k nodes and a
+        250 ms p50 with six concurrent readers, measured by
+        tests/concurrency_test.py. It is the store's real scaling limit.
+        """
         c = self._conn()
         alln = [json.loads(b) for (b,) in c.execute("SELECT body FROM nodes").fetchall()]
         c.close()
+        # No cache. A purge rewrites a node in place without changing seq, and a
+        # deleted evidence file changes a status without touching the database —
+        # any key that stays cheap is therefore wrong. The fix is to stop loading
+        # every node per query (see the perf task), not to memoise a full scan.
+        table = self._annotate_all(alln)
+        return [dict(table[n["id"]]) for n in nodes if n["id"] in table]
+
+    def _annotate_all(self, alln: list[dict]) -> dict:
         scores = self._scores(alln)
         by_id = {n["id"]: n for n in alln}
         dead, replaced = self._dead_sets(alln)
@@ -487,31 +511,33 @@ class Store:
         for n in alln:
             for p_ in (n.get("parents") or []):
                 deps[p_] = deps.get(p_, 0) + 1
-        out = []
-        for n in nodes:
+        red_targets = {v.get("claim") for v in alln
+                       if v.get("type") == "review"
+                       and (v.get("kind") or v.get("p")) == "redundant"}
+        table: dict[str, dict] = {}
+        for n in alln:
             m = dict(n)
             m["derived_status"] = self.derive_status(n, alln, by_id, dead, replaced)
-            # `scores[...]["votes"]` is a count, not a list — read the timeline.
-            red = [v for v in alln
-                   if v.get("type") == "review" and v.get("claim") == n["id"]
-                   and (v.get("kind") or v.get("p")) == "redundant"
-                   and v.get("author") != n.get("author")]
-            if red:
+            if n["id"] in red_targets:
                 m["merge_candidate"] = True
-            if n.get("refs"):
-                m["refs"] = len(n["refs"])
-                m["refs_missing"] = sum(1 for r in n["refs"] if r.get("missing"))
             rs = n.get("refs") or []
             if rs:
                 m["refs"] = len(rs)
+                m["refs_missing"] = sum(1 for r in rs if not Path(r.get("path", "")).is_file())
             if n.get("type") == "claim":
                 sc = scores.get(n["id"], {"score": 0, "votes": 0})
                 m["score"] = sc["score"]
                 m["votes"] = sc["votes"]
                 m["significance"] = n.get("significance", 3)
                 m["dependents"] = deps.get(n["id"], 0)
-            out.append(m)
-        return out
+            table[n["id"]] = m
+        return table
+
+    def _seq_gen(self) -> int:
+        c = self._conn()
+        row = c.execute("SELECT coalesce(max(seq),0) FROM nodes").fetchone()
+        c.close()
+        return int(row[0] if row else 0)
 
     def tip(self, topic: str) -> list[dict]:
         """Leaves of the edge graph, not a text match on the topic.
@@ -757,18 +783,26 @@ class Store:
             ).fetchone()
             if row and row[1] and row[1] > now and row[0] != author:
                 return {"acquired": False, "holder": row[0], "lease_until": row[1]}
+            if ttl_min <= 0:
+                # ttl<=0 is a release, not a claim: the CLI had no other way to
+                # hand a question back, and `ttl=0` used to mean "expires now",
+                # which let 8 of 20 contenders all win at once.
+                if not row:
+                    return {"released": False, "reason": "no such question"}
+                c.execute("DELETE FROM claims WHERE task_key=?", (key,))
+                self._save_claims(c)
+                return {"released": True, "task_key": key}
             c.execute(
                 "INSERT INTO claims VALUES (?,?,?,?,?,?) ON CONFLICT(task_key) DO UPDATE SET "
                 "author=excluded.author, lease_until=excluded.lease_until, status='claimed'",
                 (key, question, author, now + ttl_min * 60, "claimed",
                  datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")),
             )
+            if ttl_min > 0:
+                self._save_claims(c)  # same connection: the INSERT is uncommitted
             return {"acquired": True, "task_key": key, "lease_until": now + ttl_min * 60}
 
-        r = self._run(job)
-        if r.get("acquired"):
-            self._save_claims()  # lease must survive an index wipe
-        return r
+        return self._run(job)
 
     def reply(self, claim_id: str, payload: dict) -> dict:
         merged = dict(payload)
@@ -1163,7 +1197,15 @@ def main() -> int:
 
     default = "default" if "default" in corals else (next(iter(corals)) if len(corals) == 1 else None)
 
-    srv = ThreadingHTTPServer((a.bind, a.port),
+    # The default backlog is 5. With more than a handful of agents connecting
+    # at once the SYN queue overflows and clients retry for whole seconds, which
+    # the caller sees as "no response" — measured as 7-12% silent write loss at
+    # 100 concurrent agents. The store was never the bottleneck.
+    class CoralServer(ThreadingHTTPServer):
+        daemon_threads = True
+        request_queue_size = 256
+
+    srv = CoralServer((a.bind, a.port),
                               make_handler(corals, read_token, write_token, default))
     print(f"corallium on {a.bind}:{a.port} — {len(corals)} coral(s), default={default}", flush=True)
     for n, s in corals.items():

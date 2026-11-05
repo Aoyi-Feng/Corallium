@@ -42,6 +42,7 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -114,10 +115,15 @@ def writer_proc(port, barrier, outdir, idx, count, run_id, timeout):
         barrier.wait(timeout=120)
         t0 = time.perf_counter()
         for i in range(count):
+            # Lexically distinct objects: server.py §3.4.1 rejects (409) a new
+            # claim whose p+o is ≥0.62 similar to an existing one, so a load
+            # generator that varies only a digit measures that gate instead of
+            # concurrency.
+            tok = uuid.uuid4().hex
             payload = {
                 "s": f"bench-{run_id}",
-                "p": f"writer-{idx:03d}/claim-{i:04d}",
-                "o": f"value {idx}-{i} at {run_id}",
+                "p": f"writer-{idx:03d}/claim-{i:04d}/{tok[:8]}",
+                "o": f"{tok[:16]} measured {tok[16:24]} MB/s at queue depth {i}",
                 "author": f"bench-w{idx}",
                 "type": "claim",
                 "topics": ["bench", f"run-{run_id}"],
@@ -147,9 +153,12 @@ def writer_proc_ka(port, barrier, outdir, idx, count, run_id, timeout):
         barrier.wait(timeout=120)
         t0 = time.perf_counter()
         for i in range(count):
+            tok = uuid.uuid4().hex
             payload = {
-                "s": f"bench-ka-{run_id}", "p": f"writer-{idx:03d}/claim-{i:04d}",
-                "o": f"value {idx}-{i}", "author": f"bench-k{idx}",
+                "s": f"bench-ka-{run_id}",
+                "p": f"writer-{idx:03d}/claim-{i:04d}/{tok[:8]}",
+                "o": f"{tok[:16]} measured {tok[16:24]} MB/s keepalive",
+                "author": f"bench-k{idx}",
                 "type": "claim", "topics": ["bench"],
             }
             body = json.dumps(payload).encode()
@@ -520,7 +529,7 @@ def probe_reads(b: Bench, label: str, reps: int = 20) -> dict:
     mx = max((n.get("seq", 0) for n in nodes), default=0)
     find_lat, since_lat = [], []
     for _ in range(reps):
-        _, ms, _, _ = http(b.port, "/find?q=bench-writer", timeout=60)
+        _, ms, _, _ = http(b.port, "/find?q=measured", timeout=60)
         find_lat.append(ms)
         _, ms, _, _ = http(b.port, f"/since?cursor={max(0, mx - 200)}", timeout=60)
         since_lat.append(ms)
@@ -542,8 +551,10 @@ def scenario_idempotency(b: Bench, rounds: int = 3, n: int = 50, timeout: float 
         tag = f"idem{r}"
         outdir = b.root / f"out-{tag}"
         outdir.mkdir(exist_ok=True)
-        payload = {"s": "bench-idem", "p": f"same-proposition-round-{r}-{int(time.time())}",
-                   "o": "the store must collapse this to one node", "author": "bench-idem",
+        payload = {"s": "bench-idem",
+                   "p": f"same-proposition-round-{uuid.uuid4().hex[:12]}",
+                   "o": f"{uuid.uuid4().hex} the store must collapse this to one node",
+                   "author": "bench-idem",
                    "type": "claim", "topics": ["bench"]}
         # Predict the id the way server.add_node does (rel=root, no parents), so
         # the race starts with the node genuinely absent: a probe POST would
@@ -804,14 +815,16 @@ def scenario_reads(b: Bench, writers: int = 32, per: int = 40, readers: int = 6,
 
 # ── scenario 5: votes ──────────────────────────────────────────────────────
 def _target(b: Bench, tag: str) -> tuple[str, str]:
-    stamp = f"{tag}-{int(time.time() * 1000)}"
+    stamp = f"{tag}-{uuid.uuid4().hex[:12]}"
     _, _, prior, _ = http(b.port, "/nodes", {
-        "s": "bench-vote", "p": f"prior-{stamp}", "o": "independent prior result",
+        "s": "bench-vote", "p": f"prior-{stamp}", "o": f"prior result {uuid.uuid4().hex}",
         "author": "bench-prior", "type": "claim", "topics": ["bench"]})
     _, _, tgt, _ = http(b.port, "/nodes", {
-        "s": "bench-vote", "p": f"target-{stamp}", "o": "claim under review",
+        "s": "bench-vote", "p": f"target-{stamp}", "o": f"target claim {uuid.uuid4().hex}",
         "author": "bench-author", "type": "claim", "topics": ["bench"],
         "note": "vote determinism target"})
+    if "node" not in (prior or {}) or "node" not in (tgt or {}):
+        raise RuntimeError(f"could not create vote target: prior={prior} tgt={tgt}")
     return tgt["node"]["id"], prior["node"]["id"]
 
 
@@ -903,9 +916,105 @@ def scenario_votes(b: Bench, n: int = 20, timeout: float = 30.0):
     return out
 
 
+# ── report ─────────────────────────────────────────────────────────────────
+def print_report(res: dict) -> None:
+    """The table, from a live run or from a --json file."""
+    w = res.get("writers") or []
+    print("\n== 1. writers (distinct claims, one process per agent) ==")
+    print(f"{'N':>4} {'sent':>6} {'2xx':>6} {'lost':>6} {'5xx':>4} "
+          f"{'seqgap':>7} {'file=row':>9} {'wall':>7} {'w/s':>7} "
+          f"{'p50':>7} {'p95':>8} {'p99':>8}")
+    for r in w:
+        same = "yes" if (r["files"] == r["db_rows"]
+                         and not r["files_not_in_db"] and not r["db_not_in_files"]) else "NO"
+        print(f"{r['n']:>4} {r['sent']:>6} {r['ok']:>6} {r['no_response']:>6} "
+              f"{r['s5xx']:>4} {r['seq_gaps']:>7} {same:>9} "
+              f"{r['wall_s']:>6}s {r['thr']:>7} {r['p50']:>7} {r['p95']:>8} {r['p99']:>8}")
+    ka = res.get("keepalive")
+    if ka:
+        same = "yes" if ka["files"] == ka["db_rows"] else "NO"
+        print(f"{'100ka':>4} {ka['sent']:>6} {ka['ok']:>6} {ka['no_response']:>6} "
+              f"{ka['s5xx']:>4} {ka['seq_gaps']:>7} {same:>9} "
+              f"{ka['wall_s']:>6}s {ka['thr']:>7} {ka['p50']:>7} {ka['p95']:>8} {ka['p99']:>8}")
+
+    b = (res.get("burst") or {}).get("rows") or []
+    if b:
+        print("\n== 2. accept path: GET /health, no store work ==")
+        print(f"{'N':>4} {'ok':>4} {'lost':>5} {'p50':>8} {'p90':>8} {'p99':>9} {'>500ms':>7}")
+        for r in b:
+            print(f"{r['n']:>4} {r['ok']:>4} {r['no_response']:>5} {r['p50']:>8} "
+                  f"{r['p90']:>8} {r['p99']:>9} {r['over_500ms']:>7}")
+
+    idem = res.get("idempotency") or []
+    if idem:
+        print("\n== 3. idempotency: 50 processes, one proposition ==")
+        print(f"{'round':>5} {'201':>4} {'200 false':>9} {'no response':>11} "
+              f"{'ids':>4} {'files':>5}")
+        for r in idem:
+            print(f"{r['round']:>5} {r['created_true']:>4} "
+                  f"{r['created_false_received']:>9} {r['no_response']:>11} "
+                  f"{r['distinct_ids']:>4} {r['files_for_id']:>5}")
+
+    c = res.get("claims") or {}
+    if c:
+        ct, db = c.get("contention", {}), c.get("distinct_burst", {})
+        print("\n== 4. claims ==")
+        print(f"  one question, {ct.get('workers')} processes: "
+              f"winners={ct.get('winners')} holder={ct.get('winner')} "
+              f"p50={ct.get('p50')}ms p99={ct.get('p99')}ms resets={ct.get('no_response')}")
+        print(f"  distinct questions, {db.get('workers')} processes: "
+              f"acquired={db.get('acquired')} 500s={db.get('s5xx')} "
+              f"no_response={db.get('no_response')} "
+              f"locked_after_500={db.get('locked_after_500')}")
+        print(f"  ttl=0 race: winners={c.get('ttl0_race', {}).get('winners')}"
+              f"/{c.get('ttl0_race', {}).get('workers')}   "
+              f"release endpoint: {c.get('release_probe')}")
+
+    rd = res.get("reads") or {}
+    if rd:
+        r_, cur = rd.get("reads", {}), (rd.get("reads", {}).get("cursor") or {})
+        wrow = rd.get("writers", {})
+        print("\n== 5. reads during writes ==")
+        print(f"  writers: {wrow.get('ok')}/{wrow.get('sent')} 2xx, "
+              f"{wrow.get('no_response')} lost, p50={wrow.get('p50')}ms p99={wrow.get('p99')}ms")
+        print(f"  reads: {r_.get('reads')} total, 5xx={r_.get('s5xx')} "
+              f"bad_shape={r_.get('bad_shape')} find p50/p99={r_.get('find_p50')}/"
+              f"{r_.get('find_p99')}ms since p50/p99={r_.get('since_p50')}/"
+              f"{r_.get('since_p99')}ms")
+        print(f"  cursor consumer: {cur.get('unique_seen')} nodes, "
+              f"lost={cur.get('lost_ids')} dup={cur.get('duplicates')} "
+              f"backwards={cur.get('backwards')}")
+
+    v = res.get("votes") or {}
+    if v.get("runs"):
+        print("\n== 6. votes: 20 processes per round ==")
+        print(f"{'round':>5} {'created':>8} {'lost':>5} {'server':>7} "
+              f"{'recomputed':>10} {'repeat':>7}")
+        for r in v["runs"]:
+            print(f"{r['round']:>5} {r['created']:>4}/{r['voters']:<3} {r['no_response']:>5} "
+                  f"{r['server_score']:>7} {r['recomputed']:>10} "
+                  f"{str(r['repeat_identical']):>7}")
+        cp = v.get("collapse_probe", {})
+        print(f"  identical text from 2 authors: created={cp.get('first_created')}/"
+              f"{cp.get('second_created')} votes={cp.get('votes_counted')} "
+              f"score={cp.get('score')}")
+
+    for s in res.get("read_scaling") or []:
+        print(f"  reads @ {s['rows']} rows: find p50={s['find_p50']}ms p99={s['find_p99']}ms "
+              f"since(200) p50={s['since_p50']}ms")
+    f = res.get("final")
+    if f:
+        print(f"\n== 7. integrity == rows={f['db_rows']} files={f['files']} "
+              f"max_seq={f['max_seq']} gaps={f['seq_gaps']} dupe_seq={f['dupe_seq']} "
+              f"files-not-in-db={f['files_not_in_db']} db-not-in-files={f['db_not_in_files']} "
+              f"server_tracebacks={res.get('server_tracebacks')}")
+
+
 # ── main ───────────────────────────────────────────────────────────────────
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--report-from", default="",
+                    help="print the table for a previous --json file and exit")
     ap.add_argument("--writers", type=int, default=0,
                     help="run only this writer count (default: 8,32,100)")
     ap.add_argument("--total", type=int, default=1000, help="writes per writer run")
@@ -914,6 +1023,10 @@ def main() -> int:
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--json", default="", help="write raw results here")
     a = ap.parse_args()
+
+    if a.report_from:
+        print_report(json.loads(Path(a.report_from).read_text()))
+        return 0
 
     port = a.port or free_port()
     root = Path(a.root or tempfile.mkdtemp(prefix="corallium-bench-"))
@@ -982,6 +1095,7 @@ def main() -> int:
         print(f"  server tracebacks in log: {tbs}", flush=True)
         if tbs:
             print("\n  ".join(tail.splitlines()[-25:]))
+        print_report(b.results)
     except Exception:
         traceback.print_exc()
         rc = 2

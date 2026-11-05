@@ -1,4 +1,4 @@
-# Corallium Protocol v0.1.13
+# Corallium Protocol v0.1.14
 
 > 名字来自珊瑚：新珊瑚虫长在旧骨骼上，一层层叠，分支形态本身就是历史。
 
@@ -1248,6 +1248,7 @@ grep -c '<明文>' <root>/index.db*      # 必须全是 0
 
 ## 变更记录
 
+- **v0.1.14** — §13.10 并发契约：accept 队列 256、租约落盘移入写者队列（同一连接、唯一 tmp）、`ttl<=0` 即释放；实测 100 并发 0 数据损坏
 - **v0.1.13** — 写入前自检 §3.4（近邻 409 / extends 或 force+why_new）；`redundant` 票（−2，免 prior、需 artifact，触发 `merge_candidate`）；review 节点哈希含 author/prior/artifact（否则同文票静默合并）
 - **v0.1.12** — 新增 `refs` 文件引用（路径 + 写入时 sha256 + 行号）与 `GET /verify`；引用文件消失 → 节点派生 `suspect`；`changed` 只报警不降级
 - **v0.1.11** — 新增第六种节点类型 `task`（`o` 必须写完成条件；被放进某节点 `parents` 即视为关闭）与 `GET /tasks`；`task` 让「还没做的事」和「已知的事实」共用同一张图
