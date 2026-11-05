@@ -31,6 +31,11 @@ from urllib.parse import parse_qs, urlparse
 
 DEFAULT_PORT = 8731
 
+# PROTOCOL §4.2. `agree` is 0 on purpose: LLMs agree by default, so counting
+# agreement turns confidence into a prose-quality contest.
+WEIGHTS = {"adversarial": 4, "replicated": 3, "sourced": 2, "derived": 1,
+           "agree": 0, "refuted": -3}
+
 
 # ── storage ────────────────────────────────────────────────────────────────
 class Store:
@@ -238,12 +243,46 @@ class Store:
             out = [json.loads(b) for (b,) in cur.fetchall()]
         c.close()
 
+        out = self.annotate(out)
         outside = 0
         if root:
             keep = [n for n in out if root in (n.get("topics") or [])]
             outside = len(out) - len(keep)
             out = keep
         return out[:limit], outside
+
+    def derive_status(self, node: dict, all_nodes: list[dict]) -> str:
+        """Status is computed, never written back: nodes stay immutable and the
+        answer to "what do we believe now" tracks the graph, not a stale field."""
+        if node.get("status") == "withdrawn":
+            return "withdrawn"
+        votes = [n for n in all_nodes if n.get("type") == "review"
+                 and n.get("claim") == node["id"]
+                 and n.get("author") != node.get("author")]
+        if any((v.get("kind") or v.get("p")) == "refuted" for v in votes):
+            return "contested"
+        rivals = [n for n in all_nodes
+                  if n.get("type") == "claim" and n.get("s") == node.get("s")
+                  and n.get("p") == node.get("p") and n.get("o") != node.get("o")
+                  and n.get("status") != "withdrawn"]
+        if rivals:
+            return "contested"  # two live answers to the same question
+        strong = [v for v in votes if (v.get("kind") or v.get("p")) == "adversarial"
+                  or ((v.get("kind") or v.get("p")) == "replicated" and v.get("prior"))]
+        if strong:
+            return "confirmed"
+        return "open"
+
+    def annotate(self, nodes: list[dict]) -> list[dict]:
+        c = self._conn()
+        alln = [json.loads(b) for (b,) in c.execute("SELECT body FROM nodes").fetchall()]
+        c.close()
+        out = []
+        for n in nodes:
+            m = dict(n)
+            m["derived_status"] = self.derive_status(n, alln)
+            out.append(m)
+        return out
 
     def tip(self, topic: str) -> list[dict]:
         c = self._conn()
@@ -259,7 +298,45 @@ class Store:
         ids = {n["id"] for n in rows}
         parented = {p for n in rows for p in (n.get("parents") or []) if p in ids}
         tips = [n for n in rows if n["id"] not in parented and n.get("status") != "withdrawn"]
-        return tips or rows
+        return self.annotate(tips or rows)
+
+    def reviews(self, claim_id: str) -> dict:
+        """Every vote is its own immutable node, so the list is a timeline:
+        ts + author + kind + text + the `prior` that proves independence."""
+        c = self._conn()
+        rows = c.execute(
+            "SELECT body FROM nodes WHERE type='review' ORDER BY seq"
+        ).fetchall()
+        target = c.execute("SELECT body FROM nodes WHERE id=?", (claim_id,)).fetchone()
+        c.close()
+        if not target:
+            return {"error": f"no such node: {claim_id}"}
+        claim = json.loads(target[0])
+        votes = []
+        for (b,) in rows:
+            n = json.loads(b)
+            if n.get("claim") != claim_id:
+                continue
+            kind = n.get("kind") or n.get("p", "agree")
+            w = WEIGHTS.get(kind, 0)
+            if kind == "replicated":
+                # no `prior` = the reviewer had already seen the conclusion
+                w = 3 if n.get("prior") else 1
+            if n.get("author") == claim.get("author"):
+                votes.append({"id": n["id"], "seq": n.get("seq"), "ts": n.get("ts"),
+                              "author": n.get("author"), "kind": kind, "text": n.get("o", ""),
+                              "prior": n.get("prior"), "weight": w, "counted": False,
+                              "reason": "self-vote"})
+                continue
+            votes.append({"id": n["id"], "seq": n.get("seq"), "ts": n.get("ts"),
+                          "author": n.get("author"), "kind": kind, "text": n.get("o", ""),
+                          "prior": n.get("prior"), "weight": w, "counted": True})
+        score = sum(v["weight"] for v in votes if v["counted"])
+        kinds = {}
+        for v in votes:
+            if v["counted"]:
+                kinds[v["kind"]] = kinds.get(v["kind"], 0) + 1
+        return {"claim": claim, "score": score, "votes": votes, "tally": kinds}
 
     def max_seq(self) -> int:
         c = self._conn()
@@ -439,6 +516,9 @@ def make_handler(corals: dict, read_token: str, write_token: str, default: str |
                     return self._send(200, {"nodes": store.since(cursor, topics)})
                 if ep == "/tip":
                     return self._send(200, {"tips": store.tip(q.get("topic", [""])[0])})
+                if ep == "/reviews":
+                    r = store.reviews(q.get("claim", [""])[0])
+                    return self._send(404 if "error" in r else 200, r)
                 if ep == "/find":
                     hits, outside = store.find(q.get("q", [""])[0],
                                                root=(q.get("root", [""])[0] or ""))

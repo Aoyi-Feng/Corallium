@@ -1,4 +1,4 @@
-# Corallium Protocol v0.1.5
+# Corallium Protocol v0.1.6
 
 > 名字来自珊瑚：新珊瑚虫长在旧骨骼上，一层层叠，分支形态本身就是历史。
 
@@ -959,6 +959,7 @@ hermes plugins enable corallium
 
 ## 变更记录
 
+- **v0.1.6** — 状态改为**派生**：`contested`（存在反驳票，或同 `(s,p)` 上有第二个未撤销的不同答案）、`confirmed`（有 `prior` 的复现票或对抗票）、`open`；`GET /reviews?claim=` 返回完整投票时间线（`ts`/`author`/`kind`/`prior`/评论/权重/是否计数）与合计分数，分数不落盘
 - **v0.1.5** — 新增 §13.9：一个服务进程托管多个珊瑚（`/c/<name>/` 前缀），`registry.yaml` 每珊瑚一行；明确租约 `claims.json` 不属于派生数据，删 `index.db` 不得丢租约
 - **v0.1.4** — 独立性判据改为**上下文**而非身份，新增 `prior` 先承诺机制（无 `prior` 的 `replicated` 降权至 1）；新增 §0.1 一个珊瑚一个知识域；新增 §11.5 根约束与 §11.6 越界信号；新增 §13.7 客户端无关、§13.8 读写分级；新增 §17 部署与客户端（自建/远程/降级、不自动拉起）
 

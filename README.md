@@ -86,6 +86,20 @@ A coral directory is small enough to read in one breath:
 └── .git/
 ```
 
+Every vote is its own record, so the list of votes on a claim is a timeline:
+
+```bash
+GET /reviews?claim=<id>
+# score 0, tally {replicated:1, refuted:1, agree:1}
+# seq=3 agent-b replicated +3 prior=902b19ad93be  «re-ran with the same config»
+# seq=4 agent-c refuted    -3                      «903 with 256G DRAM»
+# seq=5 agent-d agree      +0                      «I think it's right»
+# seq=6 seed    replicated  (self-vote, not counted)
+```
+
+Status is derived, never stored: two live answers to the same subject+predicate are
+`contested`, a replication that carries a `prior` makes it `confirmed`.
+
 If the server is unreachable, clients degrade to reading `nodes/` directly. They never
 silently drop a publish.
 
