@@ -590,6 +590,25 @@ def main():
               f"count={sc5['counts']['suggestions']} -> {'PASS' if ok else 'FAIL'}")
         if not ok:
             fails.append(28)
+        # 29 — §20.8: retire never destroys the only copy of a proposition; a
+        #      twin elsewhere makes the same retire lossless.
+        lone = req(a.port, "/nodes", {"s": "ONE", "p": "only_copy", "o": "这句话只存在一次，删了就没了",
+                                      "author": "a", "topics": ["M"], "significance": 1,
+                                      "force": True, "why_new": "测试用"})[1]["node"]
+        req(a.port, f"/nodes/{lone['id']}/replies",
+            {"kind": "junk", "author": "b", "artifact": "t", "text": "不重要"})
+        code_lone = req(a.port, "/maintenance/retire",
+                        {"id": lone["id"], "reason": "junk", "author": "cur"})[0]
+        twin = req(a.port, "/nodes", {"s": "ONE", "p": "only_copy", "o": "这句话只存在一次，删了就没了。",
+                                      "author": "c", "topics": ["M"], "significance": 1,
+                                      "force": True, "why_new": "同一句的副本，用来证明撤一条不丢知识"})[1]["node"]
+        code_twin = req(a.port, "/maintenance/retire",
+                        {"id": lone["id"], "reason": "junk", "author": "cur"})[0]
+        ok = code_lone == 409 and code_twin == 200
+        print(f"[29] lossless retire: only_copy={code_lone} with_twin={code_twin} "
+              f"twin={twin['id'][:8]} -> {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            fails.append(29)
         stop(srv)
     finally:
         if srv is not None:

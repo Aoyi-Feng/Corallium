@@ -224,6 +224,20 @@ class Maint:
             # "it is wrong". That claim has to be made by someone, on the
             # record, before anything is destroyed.
             fails.append("no `junk` vote: nothing has accused this node of being a mistake")
+        # §20.8: maintenance may remove nodes, never knowledge. A retire is
+        # lossless only if the proposition still exists somewhere — either as an
+        # exact (s,p,o) twin or at >=0.90 similarity. Otherwise the right verb is
+        # `merge` (one node stands for both) or `supersedes` (the new node carries
+        # the proposition forward), both of which keep the text in the graph.
+        if reason.strip().lower() != "admin":
+            twin = any(x["id"] != node_id and x.get("type") != "tombstone"
+                       and (x.get("s"), x.get("p"), x.get("o"))
+                       == (n.get("s"), n.get("p"), n.get("o")) for x in alln)
+            near = [c for c in self._candidates(n.get("p", ""), n.get("o", ""), limit=8)
+                    if c["id"] != node_id and c["similarity"] >= 0.90]
+            if not twin and not near:
+                fails.append("this is the only copy of the proposition: retire would lose "
+                             "knowledge — use merge or supersedes, or reason=admin if it is a record")
         if fails:
             raise ApiError(409, "refusing to retire: " + "; ".join(fails))
         # Applying a proposal closes it: the record's parents are the applied
