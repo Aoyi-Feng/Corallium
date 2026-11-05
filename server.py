@@ -834,8 +834,14 @@ class Store:
                 children[p_] = children.get(p_, 0) + 1
             if n.get("type") == "review" and n.get("claim"):
                 votes[n["claim"]] = votes.get(n["claim"], 0) + 1
+        # Already-resolved nodes are not candidates: a merge or a supersede is a
+        # decision, and re-listing its inputs every scan turns the report into
+        # noise that hides the pairs that still need someone to decide.
+        resolved = {p_ for n in alln
+                    if n.get("rel") in ("merges", "supersedes")
+                    for p_ in (n.get("parents") or [])}
         live = [n for n in alln if n.get("type") in ("claim", "anomaly", "question")
-                and n.get("status") != "withdrawn"]
+                and n.get("status") != "withdrawn" and n["id"] not in resolved]
         dups, seen = [], set()
         for n in live:
             for cand in self._candidates(n.get("p", ""), n.get("o", ""), limit=12):

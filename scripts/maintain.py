@@ -131,12 +131,14 @@ def main() -> int:
     m.add_argument("--keep", required=True)
     m.add_argument("--drop", required=True)
     m.add_argument("--reason", required=True)
+    m.add_argument("--author", default=argparse.SUPPRESS)
     m.set_defaults(fn=cmd_merge)
 
     r = sub.add_parser("retire", help="L3: destroy a junk node, leave a tombstone")
     r.add_argument("--id", required=True)
     r.add_argument("--reason", required=True)
     r.add_argument("--yes", action="store_true")
+    r.add_argument("--author", default=argparse.SUPPRESS)
     r.set_defaults(fn=cmd_retire)
 
     a = ap.parse_args()

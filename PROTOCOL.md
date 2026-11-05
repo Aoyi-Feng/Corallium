@@ -1,4 +1,4 @@
-# Corallium Protocol v0.1.15
+# Corallium Protocol v0.1.16
 
 > 名字来自珊瑚：新珊瑚虫长在旧骨骼上，一层层叠，分支形态本身就是历史。
 
@@ -1252,6 +1252,7 @@ grep -c '<明文>' <root>/index.db*      # 必须全是 0
 
 ## 变更记录
 
+- **v0.1.16** — 扫描不再把已合并/已取代的节点列为重复候选（否则每次扫描都把已裁决的事重新端上来，真正待决的对被噪音淹没）
 - **v0.1.15** — §20 维护模式：L1 `link`/投票、L2 `merge`、L3 `retire`（四条机器可查门槛）、`GET /maintenance/scan`；维护行为本身记为节点
 - **v0.1.14** — §13.10 并发契约：accept 队列 256、租约落盘移入写者队列（同一连接、唯一 tmp）、`ttl<=0` 即释放；实测 100 并发 0 数据损坏
 - **v0.1.13** — 写入前自检 §3.4（近邻 409 / extends 或 force+why_new）；`redundant` 票（−2，免 prior、需 artifact，触发 `merge_candidate`）；review 节点哈希含 author/prior/artifact（否则同文票静默合并）
