@@ -297,6 +297,11 @@ class Store:
             }
             if payload.get("method"):
                 node["method"] = payload["method"]
+            # review nodes must carry what they are evidence *for*, and the
+            # prior node that proves the reviewer had not seen the conclusion.
+            for k in ("claim", "prior", "kind"):
+                if payload.get(k):
+                    node[k] = payload[k]
 
             # file first: it is the truth, and O_EXCL makes the write atomic
             path = self.nodes_dir / f"{nid}.json"
