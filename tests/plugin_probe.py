@@ -23,8 +23,8 @@ import types
 import urllib.request
 from pathlib import Path
 
-TOOLS = ["coral_find", "coral_publish", "coral_suggest", "coral_tip", "coral_vote",
-         "coral_state", "coral_claim", "coral_release"]
+TOOLS = ["coral_find", "coral_publish", "coral_suggest", "coral_show", "coral_verify",
+         "coral_tip", "coral_vote", "coral_state", "coral_claim", "coral_release"]
 
 
 def free_port():
@@ -189,6 +189,19 @@ def main():
               f"publish_types_has_suggestion={'suggestion' in pub_types} -> {'PASS' if ok else 'FAIL'}")
         if not ok:
             fails.append(8)
+        print("[9] coral_show / coral_verify")
+        m._h_vote({"node": id1, "kind": "sourced", "text": "probe checked it",
+                   "artifact": "tests/plugin_probe.py"})
+        sh = m._h_show({"node": id1})
+        rn = m._h_publish({"s": "P", "p": "sig_ref", "o": "带引用的命题", "topics": ["M"],
+                           "refs": [{"path": "/home/seed/corallium/PROTOCOL.md"}]})
+        rid = rn.split("node_id: ")[1].strip()
+        vf = m._h_verify({"node": rid})
+        ok = (id1 in sh and "status:" in sh and "sourced" in sh and vf.startswith("1 ok"))
+        print("    show=" + sh.split("\n")[1][:60] + " | verify=" + vf[:60]
+              + f" -> {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            fails.append(9)
     finally:
         srv.terminate()
         try:

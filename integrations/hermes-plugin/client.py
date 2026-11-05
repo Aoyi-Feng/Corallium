@@ -348,6 +348,43 @@ def tip(topic: str = "", coral: str = "") -> str:
         return "%s\n%s\n%s" % (coral, body, _sources(True, coral))
 
 
+def show(node: str, coral: str = "") -> str:
+    """One node with its votes as a timeline, and why its status is what it is.
+
+    `find` gives you a line; a line is not enough to decide whether to build on
+    someone. The vote list is where the argument is: who checked it, with what
+    artifact, and which votes were capped or not counted.
+    """
+    coral = pick_coral(coral)
+    node = (node or "").strip()
+    if not node:
+        return "show needs a node id (12 hex chars, from coral_find)"
+    try:
+        r = _request(_coral_path(coral, "/reviews") + "?" + urllib.parse.urlencode({"claim": node}))
+        n = r.get("node") or {}
+        lines = [_line(n), "status: %s" % (r.get("derived_status") or n.get("status") or "?"),
+                 "score: %s from %s vote(s) %s" % (r.get("score", 0), len(r.get("votes") or []),
+                                                   json.dumps(r.get("tally") or {}, ensure_ascii=False))]
+        for v in (r.get("votes") or []):
+            lines.append("  %s %-10s %s%s  %s" % (v.get("kind"), v.get("author", "?"),
+                                                  "w=%s" % v.get("weight", "?"),
+                                                  "" if v.get("counted", True) else " (not counted)",
+                                                  (v.get("text") or "")[:80]))
+        for key in ("note", "method"):
+            if n.get(key):
+                lines.append("%s: %s" % (key, n[key]))
+        return "\n".join(lines)
+    except Exception:
+        n = next((x for x in _scan(coral) if x.get("id") == node), None)
+        if not n:
+            return "no such node %s in %s (and the server is down)" % (node, coral)
+        lines = [_line(n)]
+        votes = [x for x in _scan(coral) if x.get("type") == "review" and x.get("claim") == node]
+        lines += ["  %s %-10s %s" % (v.get("kind"), v.get("author", "?"), (v.get("text") or "")[:80])
+                  for v in votes] or ["(no votes)"]
+        return "\n".join(lines) + "\n" + _sources(True, coral)
+
+
 def publish(s: str, p: str, o: str, *, coral: str = "", rel: str = "root",
             parents: list | None = None, type: str = "claim", topics: list | None = None,
             significance: int = 3, note: str = "", method: str = "",

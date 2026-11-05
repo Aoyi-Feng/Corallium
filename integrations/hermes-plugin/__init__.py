@@ -108,6 +108,27 @@ SUGGEST_SCHEMA = _schema(
      "coral": _STR},
     ("action", "targets", "why"))
 
+SHOW_SCHEMA = _schema(
+    "coral_show",
+    "Read one node in full: its proposition, its derived status, and the vote timeline — who "
+    "checked it, with what artifact, which votes counted. Use it before you build on a node or "
+    "vote on it; coral_find gives a line, and a line cannot tell you whether the claim survived "
+    "review or was only echoed. Also the fastest way to see why a node is `suspect` (a ref drifted) "
+    "or `contested` (someone disagrees with an artifact).",
+    {"node": {**_STR, "description": "Node id (12 hex chars)"},
+     "coral": _STR},
+    ("node",))
+
+VERIFY_SCHEMA = _schema(
+    "coral_verify",
+    "Check whether the files behind a claim are still the bytes it was written against. Call it "
+    "when you are about to rely on an old claim, and when you changed the files it cites: a node "
+    "whose refs `changed` is not wrong, it is unverified — the world moved and nobody re-read it. "
+    "With no node, checks the whole coral.",
+    {"node": {**_STR, "description": "Node id; omit for the whole coral"},
+     "coral": _STR},
+    ())
+
 TIP_SCHEMA = _schema(
     "coral_tip",
     "Ask what is currently believed about a topic: the leaf nodes of the graph, with contested "
@@ -187,6 +208,14 @@ def _h_suggest(args, **kw):
                       coral=str(args.get("coral") or ""))
 
 
+def _h_show(args, **kw):
+    return _c.show(str(args.get("node") or ""), coral=str(args.get("coral") or ""))
+
+
+def _h_verify(args, **kw):
+    return _c.verify(str(args.get("node") or ""), coral=str(args.get("coral") or ""))
+
+
 def _h_tip(args, **kw):
     return _c.tip(str(args.get("topic") or ""), coral=str(args.get("coral") or ""))
 
@@ -216,6 +245,8 @@ _TOOLS = (
     ("coral_find", FIND_SCHEMA, _h_find, "🪸"),
     ("coral_publish", PUBLISH_SCHEMA, _h_publish, "✍️"),
     ("coral_suggest", SUGGEST_SCHEMA, _h_suggest, "🧹"),
+    ("coral_show", SHOW_SCHEMA, _h_show, "🔍"),
+    ("coral_verify", VERIFY_SCHEMA, _h_verify, "🧪"),
     ("coral_tip", TIP_SCHEMA, _h_tip, "🌊"),
     ("coral_vote", VOTE_SCHEMA, _h_vote, "⚖️"),
     ("coral_state", STATE_SCHEMA, _h_state, "🔄"),
