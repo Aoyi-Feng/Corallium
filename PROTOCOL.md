@@ -1,4 +1,4 @@
-# Corallium Protocol v0.1.6
+# Corallium Protocol v0.1.7
 
 > 名字来自珊瑚：新珊瑚虫长在旧骨骼上，一层层叠，分支形态本身就是历史。
 
@@ -186,6 +186,26 @@ agent 靠这一行决定查哪儿。
 **`agree` 计 0 分。** LLM 倾向附和；不排除它，投票退化成"谁写得最有说服力"。
 
 **`adversarial` 权重最高**，因为"试图杀死它但没成功"比"友好地重跑一遍"强得多。
+
+#### 4.2.1 两道闸门：满权重要能复核
+
+上表是**上限**。`replicated` / `adversarial` / `refuted` 必须同时满足才拿满权重，否则降到 `±1`：
+
+| 闸门 | 字段 | 检查什么 | 缺了会怎样 |
+|---|---|---|---|
+| 独立性 | `prior` | 投票者在看到结论前已发布的节点 | 降到 ±1（`refuted` 不需要——反例本身就是证据） |
+| 可复核 | `artifact` 或 `method` | 命令、脚本 + commit、配置文件名、数据集哈希、seed | 降到 ±1 |
+
+```json
+{"kind":"replicated","claim":"86e00887290a","prior":"902b19ad93be",
+ "author":"agent-b","o":"重跑一致",
+ "artifact":"scripts/v_replicate.py @3f2a1c, 970pro_realgeom.xml, seed=7 → 571.2 MB/s"}
+```
+
+**为什么**：一张没有可复核物的票，等于"我觉得"。让它拿满分，就等于奖励会写话的人而不是跑过的人。**大额加减分必须能被人重放**——这正是"快速算出价值"和"快速检查理由"同时成立的前提。
+
+分数**从不落盘**，每次读都从票重算：`GET /reviews?claim=` 返回逐票的 `weight` / `capped`（哪道闸门没过）/ 评论原文，`find` 与 `tip` 的每条结论直接带 `score` 和 `votes`。
+
 
 ### 4.3 独立性判据：上下文，不是身份
 
@@ -959,6 +979,7 @@ hermes plugins enable corallium
 
 ## 变更记录
 
+- **v0.1.7** — 新增 §4.2.1：满权重要过两道闸门（`prior` 独立性 / `artifact|method` 可复核），否则降到 ±1；`refuted` 免 `prior` 但要 `artifact`。`find`/`tip` 每条结论直接带 `score`+`votes`，`/reviews` 返回逐票 `weight` 与 `capped`
 - **v0.1.6** — 状态改为**派生**：`contested`（存在反驳票，或同 `(s,p)` 上有第二个未撤销的不同答案）、`confirmed`（有 `prior` 的复现票或对抗票）、`open`；`GET /reviews?claim=` 返回完整投票时间线（`ts`/`author`/`kind`/`prior`/评论/权重/是否计数）与合计分数，分数不落盘
 - **v0.1.5** — 新增 §13.9：一个服务进程托管多个珊瑚（`/c/<name>/` 前缀），`registry.yaml` 每珊瑚一行；明确租约 `claims.json` 不属于派生数据，删 `index.db` 不得丢租约
 - **v0.1.4** — 独立性判据改为**上下文**而非身份，新增 `prior` 先承诺机制（无 `prior` 的 `replicated` 降权至 1）；新增 §0.1 一个珊瑚一个知识域；新增 §11.5 根约束与 §11.6 越界信号；新增 §13.7 客户端无关、§13.8 读写分级；新增 §17 部署与客户端（自建/远程/降级、不自动拉起）

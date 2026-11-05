@@ -225,7 +225,9 @@ class Store:
                         n.setdefault("id", rid)  # body may predate the id field
                         got[rid] = n
                     out = [got[i] for i in ids if i in got]
-                    out.sort(key=lambda n: n.get("seq", 0), reverse=True)
+                    # claims before review nodes: a vote mentioning "571" must
+                    # not displace the conclusion itself in a 5-row answer.
+                    out.sort(key=lambda n: (n.get("type") == "review", -n.get("seq", 0)))
             except sqlite3.OperationalError:
                 out = []
         # LIKE is a full scan (161-181 ms at 500k). Only use it when FTS cannot
@@ -281,6 +283,20 @@ class Store:
         for n in nodes:
             m = dict(n)
             m["derived_status"] = self.derive_status(n, alln)
+            if n.get("type") == "claim":
+                votes = [v for v in alln if v.get("type") == "review"
+                         and v.get("claim") == n["id"] and v.get("author") != n.get("author")]
+                total = 0
+                for v in votes:
+                    kind = v.get("kind") or v.get("p", "agree")
+                    w = WEIGHTS.get(kind, 0)
+                    if kind in ("replicated", "adversarial", "refuted"):
+                        if ((kind != "refuted" and not v.get("prior"))
+                                or not (v.get("artifact") or v.get("method"))):
+                            w = 1 if w > 0 else -1
+                    total += w
+                m["score"] = total
+                m["votes"] = len(votes)
             out.append(m)
         return out
 
@@ -319,18 +335,34 @@ class Store:
                 continue
             kind = n.get("kind") or n.get("p", "agree")
             w = WEIGHTS.get(kind, 0)
-            if kind == "replicated":
-                # no `prior` = the reviewer had already seen the conclusion
-                w = 3 if n.get("prior") else 1
+            # Two gates. A vote only carries full weight when the reviewer had
+            # not seen the conclusion (prior) AND left something another agent
+            # could actually check (artifact: command, script, dataset hash).
+            # Otherwise it is an opinion, and opinions are worth 1 or 0.
+            if kind in ("replicated", "adversarial", "refuted"):
+                checks = []
+                # `prior` proves a replicator had not seen the conclusion. A
+                # refutation needs no such thing: the counter-case is the point.
+                if kind != "refuted" and not n.get("prior"):
+                    checks.append("no-prior")
+                if not (n.get("artifact") or n.get("method")):
+                    checks.append("not-checkable")
+                if checks:
+                    w = 1 if w > 0 else -1
+                capped = checks
+            else:
+                capped = []
             if n.get("author") == claim.get("author"):
                 votes.append({"id": n["id"], "seq": n.get("seq"), "ts": n.get("ts"),
                               "author": n.get("author"), "kind": kind, "text": n.get("o", ""),
-                              "prior": n.get("prior"), "weight": w, "counted": False,
-                              "reason": "self-vote"})
+                              "prior": n.get("prior"), "artifact": n.get("artifact"),
+                              "weight": w, "capped": capped,
+                              "counted": False, "reason": "self-vote"})
                 continue
             votes.append({"id": n["id"], "seq": n.get("seq"), "ts": n.get("ts"),
                           "author": n.get("author"), "kind": kind, "text": n.get("o", ""),
-                          "prior": n.get("prior"), "weight": w, "counted": True})
+                          "prior": n.get("prior"), "artifact": n.get("artifact"),
+                          "weight": w, "capped": capped, "counted": True})
         score = sum(v["weight"] for v in votes if v["counted"])
         kinds = {}
         for v in votes:
@@ -376,7 +408,7 @@ class Store:
                 node["method"] = payload["method"]
             # review nodes must carry what they are evidence *for*, and the
             # prior node that proves the reviewer had not seen the conclusion.
-            for k in ("claim", "prior", "kind"):
+            for k in ("claim", "prior", "kind", "artifact"):
                 if payload.get(k):
                     node[k] = payload[k]
 
