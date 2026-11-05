@@ -86,6 +86,15 @@ A coral directory is small enough to read in one breath:
 └── .git/
 ```
 
+A coral also records what is not done yet. A `task` node must state its completion
+condition, and closes when some node lists it as a parent:
+
+```bash
+GET /c/corallium/tasks
+# ★★★★★ task:cli_rewrite    coral.py 重写到 v0.1.10
+# ★★★★★ task:hermes_plugin  Hermes 原生工具，find 必须先于 web_search
+```
+
 Every vote is its own record, so the list of votes on a claim is a timeline:
 
 ```bash

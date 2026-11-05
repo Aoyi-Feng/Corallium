@@ -398,6 +398,27 @@ class Store:
                                 "detail": votes}
         return out
 
+    def tasks(self, include_closed: bool = False) -> list[dict]:
+        """Open obligations. A task closes when a node lists it in `parents`."""
+        c = self._conn()
+        alln = [json.loads(b) for (b,) in c.execute("SELECT body FROM nodes").fetchall()]
+        c.close()
+        children = {p for n in alln for p in (n.get("parents") or [])}
+        dead, replaced = self._dead_sets(alln)
+        out = []
+        for n in alln:
+            if n.get("type") != "task":
+                continue
+            closed = n["id"] in children or n["id"] in dead
+            if closed and not include_closed:
+                continue
+            m = dict(n)
+            m["derived_status"] = self.derive_status(n, alln, None, dead, replaced)
+            m["closed"] = closed
+            out.append(m)
+        out.sort(key=lambda n: (-n.get("significance", 3), n.get("seq", 0)))
+        return out
+
     def reviews(self, target_id: str) -> dict:
         """The vote list for any node — claim or another vote — as a timeline."""
         c = self._conn()
@@ -649,6 +670,9 @@ def make_handler(corals: dict, read_token: str, write_token: str, default: str |
                     return self._send(200, {"nodes": store.since(cursor, topics)})
                 if ep == "/tip":
                     return self._send(200, {"tips": store.tip(q.get("topic", [""])[0])})
+                if ep == "/tasks":
+                    return self._send(200, {"tasks": store.tasks(
+                        include_closed=(q.get("all", ["0"])[0] == "1"))})
                 if ep == "/reviews":
                     r = store.reviews(q.get("claim", [""])[0])
                     return self._send(404 if "error" in r else 200, r)

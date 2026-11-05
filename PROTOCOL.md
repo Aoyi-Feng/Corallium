@@ -1,4 +1,4 @@
-# Corallium Protocol v0.1.10
+# Corallium Protocol v0.1.11
 
 > 名字来自珊瑚：新珊瑚虫长在旧骨骼上，一层层叠，分支形态本身就是历史。
 
@@ -80,7 +80,7 @@ agent 靠这一行决定查哪儿。
 - "MQSim 的 SATA 接口只有固定命令延迟，没有链路带宽路径"
 - "128K 顺序写 571 MB/s 是几何参数决定的上限"
 
-### 2.2 五种类型
+### 2.2 六种类型
 
 | type | 记录什么 | 必填字段 |
 |---|---|---|
@@ -89,6 +89,15 @@ agent 靠这一行决定查哪儿。
 | `question` | 已知的未解问题 | `question` |
 | `decision` | 人的裁决（见 §6.3） | `o` + `authority: human` |
 | `review` | 对某条 claim 的验证（见 §4） | `claim, kind` |
+| `task` | 一条尚未完成的义务 | `o` 必须写出**完成条件** |
+
+**`task` 的关闭规则**：发布一个把 task 放进 `parents` 的节点（通常是产出它的那条结论），task 就算关闭；被 `withdrawn` 也算关闭（这条义务作废了）。`GET /tasks` 只返回还没关闭的。
+
+**为什么 `o` 必须是完成条件而不是"要做 X"**：没有验收标准的义务永远不会关闭，六个月后它还是一行待办，而真正的状态是"没人记得算不算做完了"。
+
+| | 差 | 好 |
+|---|---|---|
+| `o` | 重写 CLI | `coral.py` 全部命令对 v0.1.10 服务端跑通，行为与 `tests/` 一致 |
 
 ### 2.3 字段
 
@@ -1062,6 +1071,7 @@ hermes plugins enable corallium
 
 ## 变更记录
 
+- **v0.1.11** — 新增第六种节点类型 `task`（`o` 必须写完成条件；被放进某节点 `parents` 即视为关闭）与 `GET /tasks`；`task` 让「还没做的事」和「已知的事实」共用同一张图
 - **v0.1.10** — §16.1/16.2 定义珊瑚的完整结构（`coral.yaml`/`README.md`/`.gitignore`/`nodes/`/git）与 `--init` 脚手架；`tip` 改为真正沿 `parents` 找叶子；新增撤稿级联 `suspect`（仅显式撤稿传播，`supersedes` 替换不传播）与 `attempts>5` 进 `confirmed` 的门禁；`/health` 带珊瑚 `description`/`owner`/`protocol`
 - **v0.1.9** — 新增 `significance`（1–5 星，作者声明、不投票）与派生 `dependents`；`find` 支持 `sort=significance|score|recent`。修：重建索引时重复插入 FTS 行导致同一节点出现多次
 - **v0.1.8** — 新增 §4.2.2：票本身可被投票，权重按 `1/(1+max(0,−meta)/4)` 衰减（下界 0.25），只递归一层；`/reviews?claim=` 可查任意节点（含票）的投票时间线
