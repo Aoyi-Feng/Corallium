@@ -56,9 +56,14 @@ class Maint:
         # a superseded node on the right, re-surfacing exactly the pair a
         # supersede had resolved.
         gone = {i for i, v in table.items() if v["derived_status"] == "withdrawn"}
+        # `resolved` is the wider set: a parent of a `merges` decision is settled
+        # but not withdrawn, so its old evidence and its old text keep coming
+        # back as "broken" and "duplicate" every scan — the same noise v0.1.16
+        # removed for `supersedes`. A decision was made; stop re-offering it.
+        settled = gone | resolved
         for n in live:
             for cand in self._candidates(n.get("p", ""), n.get("o", ""), limit=12):
-                if (cand["id"] == n["id"] or cand["id"] in gone
+                if (cand["id"] == n["id"] or cand["id"] in settled
                         or cand["similarity"] < 0.62):
                     continue
                 key = tuple(sorted((n["id"], cand["id"])))
@@ -70,6 +75,14 @@ class Maint:
                              "linked": (cand["id"] in (n.get("parents") or [])
                                         or n["id"] in (cand.get("parents") or []))})
         roots = [n for n in live if not (n.get("parents") or [])]
+        # §20.2 puts an orphan under a branch with a `link` (s=child, p=under,
+        # o=branch), which is deliberately not a parent edge. So the orphan list
+        # cannot shrink; what must be visible instead is how many of those roots
+        # have already been placed somewhere — otherwise every scan re-offers
+        # work that was done, and the next curator redoes it.
+        linked = {n.get("s") for n in alln
+                  if n.get("type") == "link" and n.get("p") == "under"}
+        roots_linked = [n for n in roots if n["id"] in linked]
         # Only live nodes' refs: a retracted claim's missing evidence is not a
         # maintenance item — nobody should re-check it, and re-listing it every
         # scan (as the superseded node kept doing) is exactly the noise v0.1.16
@@ -77,6 +90,7 @@ class Maint:
         broken = [{"node": n["id"], "path": r.get("path")}
                   for n in alln
                   if table[n["id"]]["derived_status"] != "withdrawn"
+                  and n["id"] not in settled
                   for r in (n.get("refs") or [])
                   if r.get("path") and not Path(r["path"]).is_file()]
         junk = []
@@ -100,6 +114,8 @@ class Maint:
         return {"duplicates": dups[:50], "orphans": [n["id"] for n in roots][:100],
                 "broken_refs": broken, "junk": junk[:50],
                 "counts": {"nodes": len(alln), "roots": len(roots),
+                           "roots_linked": len(roots_linked),
+                           "links": sum(1 for n in alln if n.get("type") == "link"),
                            # stored `status: withdrawn` is nearly always 0; this
                            # is the derived count (explicit retractions included)
                            "withdrawn": by_status.get("withdrawn", 0),

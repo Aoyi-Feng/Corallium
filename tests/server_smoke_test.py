@@ -497,6 +497,44 @@ def main():
               f"forced={code_forced} -> {'PASS' if ok else 'FAIL'}")
         if not ok:
             fails.append(24)
+        # 25 — a `link` node is a directory entry, not a belief (v0.1.21):
+        #      it must not appear in `tip`, and scan must count it as `links`
+        #      and as a placed root (`roots_linked`), because a link is not a
+        #      parent edge and the orphan list cannot shrink.
+        branch = req(a.port, "/nodes", {"s": "L", "p": "branch:test", "o": "测试分支",
+                                        "author": "a", "type": "decision", "topics": ["L"]})[1]["node"]
+        orphan = req(a.port, "/nodes", {"s": "L", "p": "orphan", "o": "没有父亲的命题",
+                                        "author": "a", "topics": ["L"]})[1]["node"]
+        lk = req(a.port, "/nodes", {"s": orphan["id"], "p": "under", "o": branch["id"],
+                                    "author": "a", "type": "link"})[1]["node"]
+        tip_ids = {t["id"] for t in req(a.port, "/tip?topic=L")[1]["tips"]}
+        sc2 = req(a.port, "/maintenance/scan")[1]
+        ok = (lk["id"] not in tip_ids and orphan["id"] in tip_ids
+              and sc2["counts"].get("links", 0) >= 1
+              and sc2["counts"].get("roots_linked", 0) >= 1)
+        print(f"[25] link is not a belief: in_tip={lk['id'] in tip_ids} "
+              f"links={sc2['counts'].get('links')} roots_linked={sc2['counts'].get('roots_linked')} "
+              f"-> {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            fails.append(25)
+        # 26 — a pair settled by `merges` must not come back as a duplicate or a
+        #      broken ref (v0.1.22): the decision was made, its inputs are history.
+        k1 = req(a.port, "/nodes", {"s": "M", "p": "cache", "o": "the write cache is 64 MB per device",
+                                    "author": "a", "topics": ["M"],
+                                    "refs": [{"path": "/no/such/file"}]})[1]["node"]
+        k2 = req(a.port, "/nodes", {"s": "M", "p": "cache", "o": "the write cache is 64 MB per device today",
+                                    "author": "a", "topics": ["M"], "force": True,
+                                    "why_new": "测试用：与上一条几乎同文"})[1]["node"]
+        req(a.port, "/maintenance/merge", {"keep": k1["id"], "drop": k2["id"],
+                                           "reason": "same fact, tested", "author": "curator"})
+        sc3 = req(a.port, "/maintenance/scan")[1]
+        dup_hit = any({k1["id"], k2["id"]} <= {d.get("a"), d.get("b")} for d in sc3["duplicates"])
+        ref_hit = any(b.get("node") in (k1["id"], k2["id"]) for b in sc3["broken_refs"])
+        ok = not dup_hit and not ref_hit
+        print(f"[26] merged pair is settled: dup_listed={dup_hit} broken_listed={ref_hit} "
+              f"-> {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            fails.append(26)
         stop(srv)
     finally:
         if srv is not None:

@@ -1,4 +1,4 @@
-# Corallium Protocol v0.1.20
+# Corallium Protocol v0.1.22
 
 > 名字来自珊瑚：新珊瑚虫长在旧骨骼上，一层层叠，分支形态本身就是历史。
 
@@ -1308,6 +1308,8 @@ grep -c '<明文>' <root>/index.db*      # 必须全是 0
 
 ## 变更记录
 
+- **v0.1.22** — 扫描把「已被 `merges` 裁决」的节点也算作已了结：`broken_refs` 与 `duplicates` 之前只看 `supersedes`／撤稿，于是被合并掉的两个分支每次扫描都重新出现——它们的旧证据缺了、两边的文字又完全相同。合并是一次决定，决定的输入不该再被当成待办。`counts` 不变，`roots_linked` 照旧。
+- **v0.1.21** — `tip` 不再把 `link` 节点当成叶子：§20.2 早就写了「link 不参与 tip 的叶子判定」，但代码没有这条，于是每补一条目录边就在「现在我们相信什么」里多一个指针。同时 `maintenance/scan` 的 `counts` 增加 `roots_linked` 与 `links`——`link` 不是父边，孤儿数不会减少，能证明组织动作落地的只有 `roots` 与 `roots_linked` 之差。
 - **v0.1.20** — 去掉 `server.py` 入口壳，只留 `python3 -m corallium`：v0.1.19 拆包时保留了 12 行壳，但那等于两个入口要同步，而先烂的永远是没人跑的那条。`corallium/__main__.py` 成为唯一入口；systemd 单元（`ExecStart=/usr/bin/python3 -m corallium` + `Environment=PYTHONPATH=`）、`coral serve`（`os.execve` 并显式给子进程 PYTHONPATH，所以从任何 cwd 都能起）、四个测试文件（统一经 `tests/_launch.py` 以 `-m` 启动）全部改为同一条路径。
 - **v0.1.19** — 服务端拆成包（§13.11）：`server.py` 从 1 588 行降到 12 行入口壳，代码进 `corallium/`（store 397 / derive 367 / write 281 / maint 266 / http 198 / registry 84 / main 81 / errors 12，全部 < 400）。理由不是审美：单文件下两个 agent 的改动按行合并，谁的语义被抹掉不会有任何冲突提示。`Store` 由四个 mixin 组合，`self.` 调用跨文件不变，所以行为不变——24 条冒烟断言在拆分前后逐条 PASS（含 v0.1.18 的父边闸门 [24]）。唯一的行为相关改动：`server_version()` 的 `VERSION` 路径改成包的上两层，否则 `/health` 会报 `unknown`。
 - **v0.1.18** — 父边不再是 §3.4 闸门的豁免。旧规则「带 `parents` 就 201」被实测利用成免检通道：同一作者以 `rel=extends` 写入了两对相似度 1.00 的重复节点（129/135、131/132），无票无 409。现在闸门对带父边的命题同样运行，只是阈值抬到 0.90——0.62 管「横向长了个近似的根」，0.90 管「纵向把同一句话再说一遍」；原因是 `extends` 天然复述父亲的一部分，用 0.62 拦它会让 agent 学会无脑 `force`，闸门反而失效。409 的候选列表里标注 `similar_to_parent`，出路是 `force`+`why_new` 或 `rel=supersedes`。
@@ -1356,7 +1358,9 @@ grep -c '<明文>' <root>/index.db*      # 必须全是 0
  "author": "curator", "note": "为什么它属于这里"}
 ```
 
-`link` **不参与** `tip` 的叶子判定（它不是父边），只用于检索与人工巡览时显示「这条其实属于那一支」。
+`link` **不参与** `tip` 的叶子判定（它不是父边），**它自己也不进 `tip`**：它是目录条目，不是信念。这两句话都必须写进代码——缺了后半句，每补一条边就在 `tip` 里多出一个指针，「现在我们相信什么」会被自己的索引淹没。
+
+`link` 的 `s` 是被挂的节点、`o` 是它挂到的分支节点，两者都必须是真实存在的 id。一次组织动作 = 每个孤儿一条 `link`（一条边一个节点，这是不可变性的代价），分支本身用 `decision` 节点（`p=branch:<name>`）当锚。
 
 ### 20.3 `retire` 的门槛
 
@@ -1397,11 +1401,13 @@ grep -c '<明文>' <root>/index.db*      # 必须全是 0
 GET /maintenance/scan
 # {"duplicates":[{"a":…,"b":…,"similarity":0.94,"linked":false}],
 #  "orphans":[…], "broken_refs":[…], "junk":[{"id":…,"why":"no children, no votes, ★1"}],
-#  "counts":{"nodes":79,"roots":54,"withdrawn":6,
+#  "counts":{"nodes":79,"roots":54,"roots_linked":12,"links":12,"withdrawn":6,
 #            "by_status":{"open":40,"confirmed":9,"contested":3,"suspect":2,"withdrawn":6}}}
 ```
 
 报告只给事实，不给建议。选哪条合并是判断，判断由人（或维护 agent）做出并留痕。
+
+**`roots` 与 `roots_linked` 必须一起读。** `link` 不是父边（§20.2），所以挂上分支之后孤儿数不会减少；能证明组织动作真的落地了的，只有这两个数之差，以及 `links` 的条数。
 
 **`counts.withdrawn` 是派生值，不是节点里存的 `status`**（后者在 v0.1.6 之后几乎恒为 `open`）。`by_status` 给出完整直方图——回答「这个珊瑚现在什么样」要的是它，而不是最后几条节点。`broken_refs` 只列**活着**的节点：被 `supersedes`／撤稿的节点即使证据文件不在，也不再是需要修的对象，每次扫描重列它只会把真正待修的那条挤下去（与 v0.1.16 对 `duplicates` 的修法同一理由）。
 
