@@ -69,6 +69,17 @@ class Store:
             CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
             """
         )
+        # FTS5 + trigram: substring search that works for CJK and for partial
+        # alphanumerics ("970" matches "970pro"). Default tokenizer splits on
+        # whitespace and would be useless on Chinese text.
+        try:
+            c.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts "
+                "USING fts5(nid UNINDEXED, txt, tokenize='trigram')"
+            )
+            self.fts_ok = True
+        except sqlite3.OperationalError:
+            self.fts_ok = False  # old sqlite without trigram: find() uses LIKE
 
     def _rebuild(self) -> None:
         """Derived index is disposable: rebuild from node files on start."""
@@ -87,8 +98,22 @@ class Store:
                  n.get("status"), json.dumps(n.get("topics", [])),
                  json.dumps(n, ensure_ascii=False)),
             )
+            self._fts_put(c, n)
         c.commit()
         c.close()
+
+    @staticmethod
+    def _fts_text(n: dict) -> str:
+        parts = [str(n.get(k) or "") for k in ("s", "p", "o", "note", "type", "author")]
+        parts += [str(t) for t in (n.get("topics") or [])]
+        return " ".join(p for p in parts if p)
+
+    def _fts_put(self, c: sqlite3.Connection, n: dict) -> None:
+        try:
+            c.execute("INSERT INTO nodes_fts(nid, txt) VALUES (?,?)",
+                      (n["id"], self._fts_text(n)))
+        except sqlite3.OperationalError:
+            pass
 
     def _writer(self) -> None:
         c = self._conn()
@@ -131,19 +156,55 @@ class Store:
         c.close()
         return out
 
-    def find(self, q: str, limit: int = 5) -> list[dict]:
+    def find(self, q: str, limit: int = 5, root: str = "") -> tuple[list[dict], int]:
+        """Returns (hits, outside_count). outside = matched but filtered by --root."""
         c = self._conn()
-        like = f"%{q.lower()}%"
-        cur = c.execute(
-            """SELECT body FROM nodes
-               WHERE lower(coalesce(s,'')||' '||coalesce(p,'')||' '||coalesce(o,'')
-                           ||' '||coalesce(body,'')) LIKE ?
-               ORDER BY seq DESC LIMIT ?""",
-            (like, limit),
-        )
-        out = [json.loads(b) for (b,) in cur.fetchall()]
+        q = (q or "").strip()
+        out: list[dict] = []
+        if len(q) >= 3:  # trigram needs 3+ chars
+            try:
+                # Order by FTS relevance (bm25), NOT by seq: ordering by seq forces
+                # a JOIN over every match (246 ms at 500k rows) while rank is free.
+                # No ORDER BY rank: bm25 scoring costs 36-49 ms per query because
+                # it scores every match. Plain LIMIT is 0.0-0.3 ms; we sort the
+                # handful of rows in Python instead.
+                ids = [r[0] for r in c.execute(
+                    "SELECT nid FROM nodes_fts WHERE nodes_fts MATCH ? LIMIT ?",
+                    ('"' + q.replace('"', '""') + '"', max(limit * 4, 20)),
+                ).fetchall()]
+                if ids:
+                    marks = ",".join("?" * len(ids))
+                    got = {}
+                    for rid, b in c.execute(
+                            f"SELECT id, body FROM nodes WHERE id IN ({marks})", ids):
+                        n = json.loads(b)
+                        n.setdefault("id", rid)  # body may predate the id field
+                        got[rid] = n
+                    out = [got[i] for i in ids if i in got]
+                    out.sort(key=lambda n: n.get("seq", 0), reverse=True)
+            except sqlite3.OperationalError:
+                out = []
+        # LIKE is a full scan (161-181 ms at 500k). Only use it when FTS cannot
+        # answer: no trigram support, or a query shorter than 3 chars. Falling
+        # back on "no hits" would make every miss the slowest possible query.
+        if not out and (not getattr(self, "fts_ok", False) or len(q) < 3):
+            like = f"%{q.lower()}%"
+            cur = c.execute(
+                """SELECT body FROM nodes
+                   WHERE lower(coalesce(s,'')||' '||coalesce(p,'')||' '||coalesce(o,'')
+                               ||' '||coalesce(body,'')) LIKE ?
+                   ORDER BY seq DESC LIMIT ?""",
+                (like, max(limit * 20, 100)),
+            )
+            out = [json.loads(b) for (b,) in cur.fetchall()]
         c.close()
-        return out
+
+        outside = 0
+        if root:
+            keep = [n for n in out if root in (n.get("topics") or [])]
+            outside = len(out) - len(keep)
+            out = keep
+        return out[:limit], outside
 
     def tip(self, topic: str) -> list[dict]:
         c = self._conn()
@@ -213,6 +274,7 @@ class Store:
                 (nid, seq, node["ts"], node["author"], node["type"], s, p, o,
                  node["status"], json.dumps(node["topics"]), json.dumps(node, ensure_ascii=False)),
             )
+            self._fts_put(c, node)
             return {"created": True, "node": node}
 
         return self._run(job)
@@ -286,7 +348,9 @@ def make_handler(store: Store, read_token: str, write_token: str):
                 if u.path == "/tip":
                     return self._send(200, {"tips": store.tip(q.get("topic", [""])[0])})
                 if u.path == "/find":
-                    return self._send(200, {"hits": store.find(q.get("q", [""])[0])})
+                    hits, outside = store.find(q.get("q", [""])[0],
+                                               root=(q.get("root", [""])[0] or ""))
+                    return self._send(200, {"hits": hits, "outside": outside})
                 return self._send(404, {"error": "not found"})
             except Exception as e:
                 return self._send(500, {"error": f"{type(e).__name__}: {e}"})
