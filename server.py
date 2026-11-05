@@ -37,7 +37,7 @@ DEFAULT_PORT = 8731
 # agreement turns confidence into a prose-quality contest.
 REQUIRED_ARTIFACT = {"refuted", "redundant"}
 WEIGHTS = {"adversarial": 4, "replicated": 3, "sourced": 2, "derived": 1,
-           "agree": 0, "refuted": -3, "redundant": -2}
+           "agree": 0, "refuted": -3, "redundant": -2, "junk": 0}
 
 # A tombstone occupies the same slot the node occupied: same id, same seq, same
 # ts. Everything that was content is gone. `status: withdrawn` is not decoration:
@@ -680,7 +680,9 @@ class Store:
                     len(mine_po & theirs_po) / len(mine_po | theirs_po))
             if j >= 0.45:
                 out.append({"id": n["id"], "p": n.get("p"), "o": n.get("o"),
-                            "status": n.get("status"), "similarity": round(j, 3)})
+                            "status": n.get("status"),
+                            "parents": n.get("parents") or [],
+                            "similarity": round(j, 3)})
         out.sort(key=lambda x: -x["similarity"])
         return out[:5]
 
@@ -811,6 +813,124 @@ class Store:
                        "p": payload.get("kind", "confirm"),
                        "o": payload.get("text", "")})
         return self.add_node(merged)
+
+    # ── 维护模式 (§20) ──────────────────────────────────────────────────────
+
+    def _all(self) -> list[dict]:
+        c = self._conn()
+        out = [json.loads(b) for (b,) in c.execute("SELECT body FROM nodes").fetchall()]
+        c.close()
+        out.sort(key=lambda n: n.get("seq", 0))
+        return out
+
+    def scan(self) -> dict:
+        """Facts only. Which duplicate to merge is a judgement, and judgements
+        leave a node behind — a scan that also recommends would launder that."""
+        alln = self._all()
+        children: dict[str, int] = {}
+        votes: dict[str, int] = {}
+        for n in alln:
+            for p_ in (n.get("parents") or []):
+                children[p_] = children.get(p_, 0) + 1
+            if n.get("type") == "review" and n.get("claim"):
+                votes[n["claim"]] = votes.get(n["claim"], 0) + 1
+        live = [n for n in alln if n.get("type") in ("claim", "anomaly", "question")
+                and n.get("status") != "withdrawn"]
+        dups, seen = [], set()
+        for n in live:
+            for cand in self._candidates(n.get("p", ""), n.get("o", ""), limit=12):
+                if cand["id"] == n["id"] or cand["similarity"] < 0.62:
+                    continue
+                key = tuple(sorted((n["id"], cand["id"])))
+                if key in seen:
+                    continue
+                seen.add(key)
+                dups.append({"a": n["id"], "b": cand["id"],
+                             "similarity": cand["similarity"],
+                             "linked": (cand["id"] in (n.get("parents") or [])
+                                        or n["id"] in (cand.get("parents") or []))})
+        roots = [n for n in live if not (n.get("parents") or [])]
+        broken = [{"node": n["id"], "path": r.get("path")}
+                  for n in alln for r in (n.get("refs") or [])
+                  if r.get("path") and not Path(r["path"]).is_file()]
+        junk = []
+        for n in live:
+            if n.get("type") == "decision":
+                continue
+            if (children.get(n["id"], 0) == 0 and votes.get(n["id"], 0) == 0
+                    and int(n.get("significance", 3)) <= 2 and not (n.get("refs"))):
+                jv = sum(1 for x in alln if x.get("type") == "review"
+                         and x.get("claim") == n["id"]
+                         and (x.get("kind") or x.get("p")) == "junk"
+                         and x.get("author") != n.get("author"))
+                junk.append({"id": n["id"], "o": n.get("o", "")[:60],
+                             "why": "no children, no votes, ★%s" % n.get("significance", 3),
+                             "author": n.get("author"), "junk_votes": jv,
+                             "retirable": bool(jv)})
+        return {"duplicates": dups[:50], "orphans": [n["id"] for n in roots][:100],
+                "broken_refs": broken, "junk": junk[:50],
+                "counts": {"nodes": len(alln), "roots": len(roots),
+                           "withdrawn": sum(1 for n in alln if n.get("status") == "withdrawn"),
+                           "duplicate_pairs": len(dups), "junk": len(junk)}}
+
+    def merge(self, keep: str, drop: str, reason: str, author: str) -> dict:
+        """L2: one node that stands for both. Nothing is destroyed — the merge
+        node's `parents` are exactly what makes tip stop showing either."""
+        alln = {n["id"]: n for n in self._all()}
+        for i in (keep, drop):
+            if i not in alln:
+                raise ApiError(404, f"unknown node {i}")
+        if keep == drop:
+            raise ValueError("keep and drop are the same node")
+        if not reason.strip():
+            raise ValueError("reason is required: a merge without a reason cannot be reviewed")
+        a, b = alln[keep], alln[drop]
+        r = self.add_node({"s": a.get("s", ""), "p": a.get("p", ""), "o": a.get("o", ""),
+                           "author": author, "type": "decision", "rel": "merges",
+                           "parents": [keep, drop], "topics": a.get("topics") or [],
+                           "significance": max(int(a.get("significance", 3)),
+                                               int(b.get("significance", 3))),
+                           "note": reason, "force": True,
+                           "why_new": "merge of %s and %s" % (keep, drop)})
+        return {"merged": r["node"]["id"], "keep": keep, "drop": drop,
+                "created": r["created"]}
+
+    def retire(self, node_id: str, reason: str, author: str) -> dict:
+        """L3: destroy content. Four machine-checkable conditions, because the
+        cost of being wrong is asymmetric: leftover junk is noise, deleting a
+        node someone builds on is an irreversible loss."""
+        alln = self._all()
+        by = {n["id"]: n for n in alln}
+        n = by.get(node_id)
+        if not n:
+            raise ApiError(404, f"unknown node {node_id}")
+        children = [x["id"] for x in alln if node_id in (x.get("parents") or [])]
+        # A `junk` vote is the accusation, not a defence: it must not close the
+        # "nobody has judged this" gate, or the accusation would veto itself.
+        votes = [x["id"] for x in alln if x.get("type") == "review"
+                 and x.get("claim") == node_id
+                 and (x.get("kind") or x.get("p")) != "junk"]
+        fails = []
+        if children:
+            fails.append(f"has {len(children)} child node(s): {children[:3]}")
+        if votes:
+            fails.append(f"has {len(votes)} vote(s): {votes[:3]}")
+        if int(n.get("significance", 3)) > 2:
+            fails.append(f"significance is {n.get('significance')} (retire allows <=2)")
+        if n.get("refs"):
+            fails.append("has file references: it is evidence-backed, not junk")
+        junk_votes = [x["id"] for x in alln if x.get("type") == "review"
+                      and x.get("claim") == node_id
+                      and (x.get("kind") or x.get("p")) == "junk"
+                      and x.get("author") != n.get("author")]
+        if not junk_votes:
+            # Structural gates say "nobody would miss it"; they cannot say
+            # "it is wrong". That claim has to be made by someone, on the
+            # record, before anything is destroyed.
+            fails.append("no `junk` vote: nothing has accused this node of being a mistake")
+        if fails:
+            raise ApiError(409, "refusing to retire: " + "; ".join(fails))
+        return self.purge(node_id, reason, author)
 
     def purge(self, node_id: str, reason: str, author: str) -> dict:
         """Destroy one node's payload, keep its place in the graph (PROTOCOL §14.3).
@@ -998,6 +1118,8 @@ def make_handler(corals: dict, read_token: str, write_token: str, default: str |
                     return self._send(200, {"tips": store.tip(q.get("topic", [""])[0])})
                 if ep == "/verify":
                     return self._send(200, store.verify_refs(q.get("node", [None])[0]))
+                if ep == "/maintenance/scan":
+                    return self._send(200, store.scan())
                 if ep == "/tasks":
                     return self._send(200, {"tasks": store.tasks(
                         include_closed=(q.get("all", ["0"])[0] == "1"))})
@@ -1037,6 +1159,15 @@ def make_handler(corals: dict, read_token: str, write_token: str, default: str |
                 if ep.startswith("/nodes/") and ep.endswith("/replies"):
                     nid = ep[len("/nodes/"):-len("/replies")]
                     return self._send(201, store.reply(nid, payload))
+                if ep == "/maintenance/merge":
+                    return self._send(201, store.merge(payload.get("keep", ""),
+                                                       payload.get("drop", ""),
+                                                       payload.get("reason", ""),
+                                                       payload.get("author", "curator")))
+                if ep == "/maintenance/retire":
+                    return self._send(200, store.retire(payload.get("id", ""),
+                                                        payload.get("reason", ""),
+                                                        payload.get("author", "curator")))
                 if ep == "/purge":
                     r = store.purge(payload.get("id", ""), payload.get("reason", ""),
                                     payload.get("author", "unknown"))
