@@ -63,18 +63,20 @@ def load_plugin(path: Path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--plugin", default=os.path.expanduser("~/.hermes/plugins/corallium"))
-    ap.add_argument("--server", default=os.path.expanduser("~/corallium/server.py"))
+    ap.add_argument("--server", default="corallium",
+                    help="module name (default: corallium) or a path to a .py file")
     a = ap.parse_args()
 
     tmp = Path(tempfile.mkdtemp(prefix="coral-plugin-"))
     root = tmp / "probe"
-    subprocess.run([sys.executable, a.server, "--init", str(root), "--init-name", "probe",
-                    "--desc", "plugin probe", "--owner", "test"],
-                   check=True, stdout=subprocess.DEVNULL)
+    from _launch import argv, env
+    subprocess.run(argv(a.server, "--init", root, "--init-name", "probe",
+                        "--desc", "plugin probe", "--owner", "test"),
+                   check=True, stdout=subprocess.DEVNULL, env=env())
     port = free_port()
-    srv = subprocess.Popen([sys.executable, a.server, "--root", str(root),
-                            "--port", str(port), "--bind", "127.0.0.1"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    srv = subprocess.Popen(argv(a.server, "--root", root, "--port", port,
+                                "--bind", "127.0.0.1"),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env())
     fails = []
     try:
         wait_health(port)

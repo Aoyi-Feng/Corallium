@@ -6,14 +6,15 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/home/seed/corallium
+Environment=PYTHONPATH=/home/seed/corallium
 # Absolute interpreter path on purpose: a user unit does not get the login PATH,
 # and `python3` from a pyenv/venv/uv shim may not exist after the next upgrade.
-ExecStart=/usr/bin/python3 /home/seed/corallium/server.py --registry %h/corals/registry.yaml --port 8731 --bind 127.0.0.1
+ExecStart=/usr/bin/python3 -m corallium --registry %h/corals/registry.yaml --port 8731 --bind 127.0.0.1
 Restart=on-failure
 RestartSec=3
 
 # Tokens are NOT written in this unit. By default both variables are unset, which
-# means "open on 127.0.0.1 only" (server.py: empty token → local trust). To require
+# means "open on 127.0.0.1 only" (corallium: empty token → local trust). To require
 # tokens, create %h/.config/corallium/env with mode 0600 containing
 #   CORALLIUM_READ_TOKEN=...
 #   CORALLIUM_WRITE_TOKEN=...

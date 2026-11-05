@@ -46,7 +46,7 @@ import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SERVER = HERE.parent / "server.py"
+SERVER = "corallium"  # launched as `python3 -m corallium` (§13.11)
 
 # Mirrors server.WEIGHTS; the point of recomputing is that the benchmark does
 # not call the server's own scoring code, it re-derives the number from nodes.
@@ -115,7 +115,7 @@ def writer_proc(port, barrier, outdir, idx, count, run_id, timeout):
         barrier.wait(timeout=120)
         t0 = time.perf_counter()
         for i in range(count):
-            # Lexically distinct objects: server.py §3.4.1 rejects (409) a new
+            # Lexically distinct objects: write.py §3.4.1 rejects (409) a new
             # claim whose p+o is ≥0.62 similar to an existing one, so a load
             # generator that varies only a digit measures that gate instead of
             # concurrency.
@@ -1037,16 +1037,16 @@ def main() -> int:
     print(f"server {SERVER}\nroot   {root}\nport   {port}  "
           f"python {sys.version.split()[0]}  cores {os.cpu_count()}", flush=True)
 
-    init = subprocess.run([sys.executable, str(SERVER), "--init", str(root),
-                           "--init-name", "bench"],
-                          capture_output=True, text=True)
+    from _launch import argv as _argv, env as _env
+    init = subprocess.run(_argv(SERVER, "--init", root, "--init-name", "bench"),
+                          capture_output=True, text=True, env=_env())
     if init.returncode != 0:
         print("init failed:", init.stdout, init.stderr)
         return 2
     fh = open(log, "w")
-    srv = subprocess.Popen([sys.executable, str(SERVER), "--root", str(root),
-                            "--port", str(port), "--bind", "127.0.0.1"],
-                           stdout=fh, stderr=subprocess.STDOUT)
+    srv = subprocess.Popen(_argv(SERVER, "--root", root, "--port", port,
+                                 "--bind", "127.0.0.1"),
+                           stdout=fh, stderr=subprocess.STDOUT, env=_env())
     b = Bench(port, root)
     rc = 0
     try:

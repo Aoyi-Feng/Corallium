@@ -9,7 +9,7 @@ somewhere before, which is why each gets its own assertion:
   3. the id still resolves and children become `suspect` instead of dangling
   4. deleting index.db and restarting does not resurrect any of it
 
-Usage:  python3 tests/test_purge.py [--server ~/corallium/server.py] [--port 0]
+Usage:  python3 tests/test_purge.py [--server corallium] [--port 0]
 Exit code 0 = all passed.
 """
 import argparse, glob, json, os, shutil, socket, subprocess, sys, tempfile
@@ -40,9 +40,10 @@ def wait_health(port, timeout=15.0):
 
 
 def start(server, root, port):
+    from _launch import argv, env
     p = subprocess.Popen(
-        [sys.executable, server, "--root", root, "--port", str(port), "--bind", "127.0.0.1"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        argv(server, "--root", root, "--port", port, "--bind", "127.0.0.1"),
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env())
     wait_health(port)
     return p
 
@@ -75,7 +76,8 @@ def hits(port, q):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--server", default=os.path.expanduser("~/corallium/server.py"))
+    ap.add_argument("--server", default="corallium",
+                    help="module name (default: corallium) or a path to a .py file")
     ap.add_argument("--port", type=int, default=0, help="0 = pick a free port")
     a = ap.parse_args()
     a.port = a.port or free_port()

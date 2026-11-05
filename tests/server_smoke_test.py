@@ -7,7 +7,7 @@ Proves the four properties whose failure silently corrupts the record:
   3. the SQLite index is disposable (rebuild from nodes/, seq never reused)
   4. a read token cannot write
 
-Usage:  python3 server_smoke_test.py [--server ~/corallium/server.py] [--port 8799]
+Usage:  python3 server_smoke_test.py [--server corallium] [--port 8799]
 Exit code 0 = all passed.
 """
 import argparse, concurrent.futures as cf, glob, json, os, shutil, socket
@@ -36,13 +36,11 @@ def wait_health(port, timeout=15.0):
 
 
 def start(server, root, port, env_extra=None, extra=None):
-    env = dict(os.environ)
-    env.update(env_extra or {})
-    args = [sys.executable, server] + (extra if extra is not None
-                                       else ["--root", root])
+    from _launch import argv, env
+    args = argv(server, *(extra if extra is not None else ["--root", root]))
     p = subprocess.Popen(
         args + ["--port", str(port), "--bind", "127.0.0.1"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env)
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env(env_extra))
     wait_health(port)
     return p
 
@@ -70,7 +68,8 @@ def req(port, path, payload=None, token=None, method=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--server", default=os.path.expanduser("~/corallium/server.py"))
+    ap.add_argument("--server", default="corallium",
+                    help="module name (default: corallium) or a path to a .py file")
     ap.add_argument("--port", type=int, default=0, help="0 = pick a free port")
     a = ap.parse_args()
     a.port = a.port or free_port()  # a fixed port collides with a stale child

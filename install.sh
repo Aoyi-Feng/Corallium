@@ -22,7 +22,7 @@
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SERVER="$SELF_DIR/server.py"
+SERVER="$SELF_DIR/corallium/__main__.py"
 DEPLOY_UNIT="$SELF_DIR/deploy/corallium.service"
 
 CONFIG="${HERMES_CONFIG:-$HOME/.hermes/config.yaml}"
@@ -104,7 +104,7 @@ done
 
 case "$PORT" in ''|*[!0-9]*) die "--port must be a number, got '$PORT'" ;; esac
 [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "--port out of range: $PORT"
-[ -f "$SERVER" ] || die "server.py not found next to install.sh ($SERVER)"
+[ -f "$SERVER" ] || die "corallium package not found next to install.sh (looked for $SERVER)"
 
 # ── pick interpreter (install-time needs yaml; the unit prefers /usr/bin/python3)
 
@@ -630,10 +630,14 @@ regarg = "%h/corals/registry.yaml" if reg == os.path.expanduser("~/corals/regist
 out = []
 for line in open(src, encoding="utf-8"):
     if line.startswith("ExecStart="):
-        line = ("ExecStart=%s %s/server.py --registry %s"
-                " --port %s --bind %s\n" % (py, repo, regarg, port, bind))
+        line = ("ExecStart=%s -m corallium --registry %s"
+                " --port %s --bind %s\n" % (py, regarg, port, bind))
     elif line.startswith("WorkingDirectory="):
         line = "WorkingDirectory=%s\n" % repo
+    elif line.startswith("Environment=PYTHONPATH="):
+        # `-m corallium` resolves against sys.path; WorkingDirectory covers the
+        # normal case, this covers an interpreter that drops cwd from sys.path.
+        line = "Environment=PYTHONPATH=%s\n" % repo
     elif line.startswith("Documentation=file://"):
         line = "Documentation=file://%s/DEPLOY.md\n" % repo
     out.append(line)

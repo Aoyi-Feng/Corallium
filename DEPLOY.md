@@ -8,7 +8,7 @@ system has (PROTOCOL §13.6), so starting is always an explicit human action.
 ```
 install.sh  ──writes──►  ~/.hermes/config.yaml   (url, coral, tokens, read_only)
             ──writes──►  ~/corals/registry.yaml  (self-hosted only)
-            ──runs───►   server.py --init        (self-hosted only, never starts it)
+            ──runs───►   python3 -m corallium --init   (self-hosted only, never starts it)
             ──writes──►  ~/.config/systemd/user/corallium.service   (--with-service)
 ```
 
@@ -35,7 +35,7 @@ What it does:
 
 1. creates `~/corals/registry.yaml` if missing, adds `name: description` if the
    coral is not listed yet (never duplicates a line);
-2. scaffolds `~/corals/<name>/` with `server.py --init` **only if
+2. scaffolds `~/corals/<name>/` with `python3 -m corallium --init` **only if
    `coral.yaml` is absent** — an existing coral is never touched;
 3. writes `corallium:` into `~/.hermes/config.yaml`;
 4. prints the exact start command and exits.
@@ -43,7 +43,7 @@ What it does:
 It does **not** start the server. Run the printed line yourself:
 
 ```bash
-/usr/bin/python3 ~/corallium/server.py --registry ~/corals/registry.yaml --port 8731 --bind 127.0.0.1
+cd ~/corallium && /usr/bin/python3 -m corallium --registry ~/corals/registry.yaml --port 8731 --bind 127.0.0.1
 ```
 
 One server per data directory. A second instance on the same `~/corals` will

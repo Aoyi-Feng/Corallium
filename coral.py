@@ -633,16 +633,20 @@ def cmd_serve(a) -> int:
     """Run the reference server in this process (PROTOCOL §17.1).
 
     A launcher, not a second storage model: coral.py still owns no node, no
-    index and no lease — it replaces itself with `server.py`, which does. The
-    protocol has promised `coral serve` in three places (§17.1, §17.4, README)
-    while the CLI had no such subcommand, so the command §17.4 tells a stuck
-    user to run answered "invalid choice: 'serve'".
+    index and no lease — it replaces itself with `python3 -m corallium`, which
+    does. The protocol has promised `coral serve` in three places (§17.1,
+    §17.4, README) while the CLI had no such subcommand, so the command §17.4
+    tells a stuck user to run answered "invalid choice: 'serve'".
+
+    The server is a package with exactly one entry point (§13.11); there is no
+    server.py to exec, and `-m` is used rather than importing `main` here so the
+    process the CLI hands over to is the same one systemd starts.
     """
-    server = Path(__file__).resolve().with_name("server.py")
-    if not server.is_file():
-        die(f"server.py not found next to coral.py ({server}) — reinstall, the CLI "
-            "cannot serve a coral without it")
-    argv = [sys.executable, str(server)]
+    repo = Path(__file__).resolve().parent
+    if not (repo / "corallium" / "__main__.py").is_file():
+        die(f"corallium package not found next to coral.py ({repo}) — reinstall, "
+            "the CLI cannot serve a coral without it")
+    argv = [sys.executable, "-m", "corallium"]
     if a.registry:
         argv += ["--registry", str(Path(a.registry).expanduser())]
     elif a.root:
@@ -651,13 +655,18 @@ def cmd_serve(a) -> int:
         argv += ["--root", str(corals_dir() / a.coral)]
     else:
         # A multi-coral install already has the index of where to look; a
-        # single-coral one falls through to server.py's own default.
+        # single-coral one falls through to the package's own default.
         reg = corals_dir() / "registry.yaml"
         if reg.is_file():
             argv += ["--registry", str(reg)]
     argv += ["--port", str(a.port), "--bind", a.bind]
+    # `-m` resolves against sys.path, and the CLI may be run from anywhere:
+    # hand the child the repo root explicitly instead of trusting cwd.
+    env = dict(os.environ)
+    prev = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = str(repo) + (os.pathsep + prev if prev else "")
     sys.stdout.flush()
-    os.execv(sys.executable, argv)  # never returns
+    os.execve(sys.executable, argv, env)  # never returns
     return 1
 
 

@@ -70,7 +70,7 @@ Two forms, one protocol:
 One process can serve several corals, addressed by prefix:
 
 ```bash
-python3 server.py --registry ~/corals/registry.yaml --port 8731
+python3 -m corallium --registry ~/corals/registry.yaml --port 8731
 #   /c/mqsim/find?q=571
 #   /c/trading/since?cursor=41
 #   /health          → every coral and its max_seq
@@ -144,8 +144,8 @@ prove it are in `tests/`.
 
 | Piece | State |
 |---|---|
-| `PROTOCOL.md` | v0.1.17, the source of truth |
-| `server.py` | stdlib `http.server` + `sqlite3`, one process serving many corals (`/c/<name>/…`): write gate, derived status, vote timeline, `refs` + `/verify`, `purge` tombstones, maintenance `scan`/`merge`/`retire`, `/claims` |
+| `PROTOCOL.md` | v0.1.20, the source of truth |
+| `corallium/` | stdlib `http.server` + `sqlite3`, **8 modules, none over 400 lines** (store / derive / write / maint / http / registry / main / errors); one process serving many corals (`/c/<name>/…`): write gate, derived status, vote timeline, `refs` + `/verify`, `purge` tombstones, maintenance `scan`/`merge`/`retire`, `/claims`. Started with `python3 -m corallium` — there is no `server.py`. |
 | `coral.py` | HTTP client; reads degrade to scanning `nodes/*.json`, writes fail loudly, `coral serve` starts the server |
 | Hermes plugin | `~/.hermes/plugins/corallium/` — seven tools (`find`, `publish`, `tip`, `vote`, `state`, `claim`, `release`) |
 | Tests | `tests/server_smoke_test.py` — the write path, claims, derived status, refs and the write gate, each asserted against a throwaway port; `tests/plugin_probe.py` — the seven plugin handlers against a throwaway coral |
