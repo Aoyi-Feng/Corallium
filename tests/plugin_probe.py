@@ -23,8 +23,8 @@ import types
 import urllib.request
 from pathlib import Path
 
-TOOLS = ["coral_find", "coral_publish", "coral_tip", "coral_vote", "coral_state",
-         "coral_claim", "coral_release"]
+TOOLS = ["coral_find", "coral_publish", "coral_suggest", "coral_tip", "coral_vote",
+         "coral_state", "coral_claim", "coral_release"]
 
 
 def free_port():
@@ -169,6 +169,26 @@ def main():
               f"state={'ok' if 'new since' in st else st!r} -> {'PASS' if ok else 'FAIL'}")
         if not ok:
             fails.append(7)
+        print("[8] coral_suggest: proposal stored, execution not offered")
+        s1 = m._h_publish({"s": "P", "p": "sig_a", "o": "第一个命题", "topics": ["M"]})
+        s2 = m._h_publish({"s": "P", "p": "sig_b", "o": "第二个命题", "topics": ["M"]})
+        id1 = s1.split("node_id: ")[1].strip()
+        id2 = s2.split("node_id: ")[1].strip()
+        sg = m._h_suggest({"action": "merge", "targets": [id1, id2],
+                           "why": "两条说的是同一件事，合并后少一条"})
+        sg_id = sg.split("node_id: ")[1].strip()
+        node = json.load(open(next(Path(root, "nodes").glob(sg_id + ".json"))))
+        names = set(TOOLS)
+        schemas = {n: s for n, s, _h, _e in m._TOOLS}
+        pub_types = schemas["coral_publish"]["parameters"]["properties"]["type"]["enum"]
+        ok = (node.get("type") == "suggestion" and node.get("action") == "merge"
+              and node.get("targets") == [id1, id2]
+              and "suggestion" not in pub_types
+              and not any("maint" in n for n in names))
+        print(f"    suggestion={node.get('action')}/{len(node.get('targets') or [])} targets "
+              f"publish_types_has_suggestion={'suggestion' in pub_types} -> {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            fails.append(8)
     finally:
         srv.terminate()
         try:

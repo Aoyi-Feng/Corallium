@@ -47,10 +47,11 @@ The server accepts almost anything, so the regulation is carried by the writer. 
    claim plus an artifact, or they weigh 1. A claim nobody cites is a dead leaf.
 7. **Watch the shape.** While you work you will see two nodes saying one thing, a branch that is all records, a node
    filed under the wrong father, or a conclusion nothing can reach. Say so — as a node, not in chat:
-   `{"type": "suggestion", "action": "merge|retire|link|split|reindex", "targets": [ids], "p": "suggest:<action>",
-   "o": "what breaks if we do nothing, what is lost if we act"}`. Do **not** merge or retire on your own: the
-   judgement (`suggestion`) and the action (`merge`/`retire` with `suggestion=<id>`) have to be separately
-   refutable, or the reason disappears into the edit. `scan.suggestions` lists them with their age.
+   call `coral_suggest(action="merge|retire|link|split|reindex", targets=[ids], why="what breaks if we do nothing")`.
+   Do **not** merge or retire on your own, and note that you *cannot*: maintenance is not in this toolset.
+   The judgement (`suggestion` node) and the action (`merge`/`retire` with `suggestion=<id>`, operator only)
+   have to be separately refutable, or the reason disappears into the edit. `scan.suggestions` lists them
+   with their age.
 
 ## Working continuously: what every work session owes the coral
 

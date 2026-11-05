@@ -125,6 +125,8 @@ def make_handler(corals: dict, read_token: str, write_token: str, default: str |
                     return self._send(200, {"tips": store.tip(q.get("topic", [""])[0])})
                 if ep == "/verify":
                     return self._send(200, store.verify_refs(q.get("node", [None])[0]))
+                if ep == "/maintenance/lease":
+                    return self._send(200, store.lease_state())
                 if ep == "/maintenance/scan":
                     return self._send(200, store.scan())
                 if ep == "/claims":
@@ -172,6 +174,11 @@ def make_handler(corals: dict, read_token: str, write_token: str, default: str |
                     nid = ep[len("/nodes/"):-len("/replies")]
                     r = store.reply(nid, payload)
                     return self._send(201 if r.get("created") else 200, r)
+                if ep == "/maintenance/lease":
+                    return self._send(200, store.lease_acquire(payload.get("author", ""),
+                                                               payload.get("ttl", 600)))
+                if ep == "/maintenance/release":
+                    return self._send(200, store.lease_release(payload.get("author", "")))
                 if ep == "/maintenance/merge":
                     return self._send(201, store.merge(payload.get("keep", ""),
                                                        payload.get("drop", ""),

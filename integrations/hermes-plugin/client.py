@@ -466,6 +466,18 @@ def release(question: str, coral: str = "") -> str:
     return "no such question: %s" % question
 
 
+def suggest(action: str, targets: list, why: str, *, topics: list | None = None,
+            significance: int = 2, coral: str = "") -> str:
+    """Propose maintenance without doing it (§20.7).
+
+    The judgement is a node so it can be refuted; the action stays with the
+    operator, so a wrong proposal costs a vote rather than a deletion.
+    """
+    return publish("maintenance", "suggest:%s" % action, why, coral=coral,
+                   type="suggestion", topics=topics or ["maintenance"],
+                   significance=significance, action=action, targets=list(targets or []))
+
+
 def vote(node: str, kind: str, text: str, *, coral: str = "", prior: str = "",
          artifact: str = "") -> str:
     coral = pick_coral(coral)

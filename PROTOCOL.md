@@ -1,4 +1,4 @@
-# Corallium Protocol v0.1.27
+# Corallium Protocol v0.1.28
 
 > 名字来自珊瑚：新珊瑚虫长在旧骨骼上，一层层叠，分支形态本身就是历史。
 
@@ -1308,6 +1308,7 @@ grep -c '<明文>' <root>/index.db*      # 必须全是 0
 
 ## 变更记录
 
+- **v0.1.28** — §20.10 维护是串行的：新增 `POST /maintenance/lease {author, ttl}` / `POST /maintenance/release` / `GET /maintenance/lease`；`merge`/`retire`/`repin` 必须由租约持有者发起，否则 409。建议节点不受限制——提案可以并行，执行只能一个人。插件的 `coral_suggest` 是唯一的维护形工具，`coral_publish` 不再接受 `type=suggestion`。
 - **v0.1.27** — 建议节点真的被存下来了：`add_node` 之前对 `type=suggestion` 的 `action`/`targets` 直接丢弃（插件一直在发，服务端一直扔，`scan` 里每条建议都是 `action: null`）。现在写入时校验并落盘：`action` 必须是 merge/retire/link/split/reindex 之一，`targets` 必须非空且都存在，否则 400——与 `parents` 同一条理由：打错字必须当场失败，而不是永久落盘。
 - **v0.1.26** — §20.9 引用是指针，不是命题：`refs` 在仓库内的路径改为相对存储（仓库根写在 `coral.yaml` 的 `repo:`，家目录内的写 `~/…`），验证时按同一规则解析；新增 `POST /maintenance/repin {from,to}` 原地改写一批节点的 refs（同 id、同 seq、重算 sha256），并发一条 decision 作为唯一记录；`rel=supersedes` 在 `s/p/o` 与父节点完全相同时返回 409。这是 118→276→315 那条三胞胎链的成因：文件名一改，唯一合法的修法是重发同一条命题。现在改路径只用一次维护动作，改完不会多一个节点。`retire` 新增 `reason=duplicate`：命题在别处存在时，即使 significance 高也允许删除（唯一副本仍然拒绝）。
 - **v0.1.25** — §20.8 维护不能消灭知识：`retire` 增加一道机器可查的检查——只有当命题在别处仍然存在（相似度 ≥0.90 的另一条活节点）或属于 §20.6 的行政节点（`reason=admin`）时才允许；否则返回 409 并指出「这是唯一副本」，正确动词是 `merge` 或 `supersedes`。这让「不丢知识」从承诺变成检查：今天 3 条 junk 候选里没有一条有近邻，它们现在都删不掉——这不是退化，是这条规则本来要拦的东西。
@@ -1471,6 +1472,16 @@ GET /maintenance/scan
 - **`supersedes` 必须带来新知识**。`s/p/o` 与父节点完全相同 → 409，提示改用 repin。修正命题（`o` 真的变了）不受影响。
 
 这条规则把「副本」从增长方式里删掉，而不是事后清理：没有 repin 之前，改名只能靠复制；有了 repin，复制就没有理由。
+
+### 20.10 维护是串行的
+
+提案可以并行，执行不行。
+
+- `coral_suggest` / `type=suggestion` 是 append-only 的判断，谁都能在任何时候写；它只能被 `redundant` 投票否掉，不能直接生效。
+- `POST /maintenance/lease {author, ttl}` 取租约。同一时刻只有一个持有者；`merge`、`retire`、`repin` 必须由持有者发起，否则 409 并说明是谁、还剩几秒。`POST /maintenance/release` 交还，`GET /maintenance/lease` 查状态。
+- 租约到期自动失效（默认 600 秒，上限 3600），所以一次崩溃不会把珊瑚永久锁死，而一次长时间批处理需要显式续租。
+
+理由是形状而不是礼貌：两个人同时维护，一个合并 A，另一个删除 A 的双胞胎，结果是一个谁都没有选择过的珊瑚，而两条维护记录各自都自洽——事后无法判定哪一步错了。串行让每一步都有一个可以被单独追问的人。
 
 **删除重复**：`reason=duplicate` 只需要一条证据——同一 `(s,p,o)` 的副本仍然活着。满足时其余门槛（子节点、非 junk 票、星级、refs）全部让路：副本已经证明这条命题还在，而墓碑保留 id，所以下游的 `parents` 不会悬空。历史上那些 `supersedes` 链的中间代就是这么清掉的——清理之后，同一个命题只剩最新那一代，链断在墓碑上，不再断在空气里。
 

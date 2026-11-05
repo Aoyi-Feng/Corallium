@@ -167,10 +167,81 @@ class Maint:
 
 
 
+    LEASE = "maintenance_lease"
+
+    def _now(self) -> float:
+        import time
+        return time.time()
+
+    def lease_acquire(self, author: str, ttl: int = 600) -> dict:
+        """§20.10: maintenance runs one curator at a time.
+
+        Suggestions may be written in parallel — they are append-only opinions.
+        Executing them is not: merging A while someone retires A's twin produces
+        a shape nobody chose, and the two records each look correct on their own.
+        The lease is the unit of that decision, and it expires, so a crashed
+        curator does not lock the coral forever.
+        """
+        author = (author or "").strip()
+        if not author:
+            raise ValueError("lease needs an author")
+        ttl = max(30, min(int(ttl or 600), 3600))
+
+        def job(c):
+            now = self._now()
+            row = c.execute("SELECT v FROM meta WHERE k=?", (self.LEASE,)).fetchone()
+            cur = json.loads(row[0]) if row else None
+            if cur and cur["until"] > now and cur["author"] != author:
+                raise ApiError(409, "maintenance is held by %s for another %d s; "
+                                    "propose a suggestion instead of acting (§20.7)"
+                               % (cur["author"], int(cur["until"] - now)))
+            rec = {"author": author, "since": now, "until": now + ttl, "ttl": ttl}
+            c.execute("INSERT OR REPLACE INTO meta(k, v) VALUES(?,?)",
+                      (self.LEASE, json.dumps(rec)))
+            return rec
+
+        return self._run(job)
+
+    def lease_release(self, author: str) -> dict:
+        def job(c):
+            row = c.execute("SELECT v FROM meta WHERE k=?", (self.LEASE,)).fetchone()
+            if not row:
+                return {"released": False, "holder": None}
+            cur = json.loads(row[0])
+            if cur["author"] != author:
+                raise ApiError(409, "the lease is held by %s" % cur["author"])
+            c.execute("DELETE FROM meta WHERE k=?", (self.LEASE,))
+            return {"released": True, "holder": author}
+
+        return self._run(job)
+
+    def lease_state(self) -> dict:
+        row = self._conn().execute("SELECT v FROM meta WHERE k=?", (self.LEASE,)).fetchone()
+        cur = json.loads(row[0]) if row else None
+        if not cur:
+            return {"held": False}
+        return {"held": cur["until"] > self._now(), "author": cur["author"],
+                "seconds_left": max(0, int(cur["until"] - self._now()))}
+
+    def _need_lease(self, c, author: str) -> dict:
+        row = c.execute("SELECT v FROM meta WHERE k=?", (self.LEASE,)).fetchone()
+        cur = json.loads(row[0]) if row else None
+        now = self._now()
+        if not cur or cur["until"] <= now:
+            raise ApiError(409, "no maintenance lease: POST /maintenance/lease {author} "
+                                "first. Maintenance is serial by design (§20.10) — "
+                                "parallel merges produce a shape nobody chose")
+        if cur["author"] != (author or "").strip():
+            raise ApiError(409, "maintenance lease is held by %s (%d s left); "
+                                "another curator is acting" % (cur["author"],
+                                                               int(cur["until"] - now)))
+        return cur
+
     def merge(self, keep: str, drop: str, reason: str, author: str,
               suggestion: str = "") -> dict:
         """L2: one node that stands for both. Nothing is destroyed — the merge
         node's `parents` are exactly what makes tip stop showing either."""
+        self._need_lease(self._conn(), author)
         alln = {n["id"]: n for n in self._all()}
         for i in (keep, drop):
             if i not in alln:
@@ -197,6 +268,7 @@ class Maint:
         """L3: destroy content. Four machine-checkable conditions, because the
         cost of being wrong is asymmetric: leftover junk is noise, deleting a
         node someone builds on is an irreversible loss."""
+        self._need_lease(self._conn(), author)
         alln = self._all()
         by = {n["id"]: n for n in alln}
         n = by.get(node_id)
@@ -282,6 +354,7 @@ class Maint:
             raise ValueError("repin needs both `from` and `to`")
         if old == new:
             raise ValueError("from and to are the same path")
+        self._need_lease(self._conn(), author)
         want = set(nodes or [])
 
         def job(c):

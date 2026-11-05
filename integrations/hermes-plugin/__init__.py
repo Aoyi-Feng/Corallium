@@ -4,6 +4,11 @@ Wiring goes only through the public plugin API (`ctx.register_tool`). The plugin
 holds no state and no daemon: every call is an HTTP request to the coral server, or
 a read of the coral directory when the server is down.
 
+The plugin can propose maintenance and cannot perform it. `coral_suggest` writes a
+suggestion node; scan/merge/retire/repin are deliberately not tools here. A curator
+who can delete in the same breath as it writes has no one to check it, and every
+deletion that turns out wrong takes its reason with it.
+
 Tool ordering matters more than the tool bodies. An agent reaches for `web_search`
 by reflex; if `coral_find` is not named in that reflex, the knowledge base is dead
 weight. Every description therefore starts with the same sentence: check here first.
@@ -50,8 +55,9 @@ PUBLISH_SCHEMA = _schema(
     "method (command/config/version/seed) and refs (absolute paths). (4) topics from the fixed list: "
     "design, protocol, storage, retrieval, votes, plugin, cli, server, bench, org, deploy, experiment. "
     "(5) While you work: a duplicate, a record-shaped node, a wrong parent or an unreachable conclusion "
-    "is a `suggestion` node (type=suggestion, action=merge|retire|link|split|reindex, targets=[ids], "
-    "o = what breaks if nothing is done) — never a silent merge or retire, so the judgement stays refutable. "
+    "is a `coral_suggest` call (action=merge|retire|link|split|reindex, targets=[ids], why = what "
+    "breaks if nothing is done) — never a silent merge or retire: proposing and executing are "
+    "different powers, and you only have the first. "
     "Full regulation: ~/.hermes/plugins/corallium/GUIDE.md.",
     {"s": {**_STR, "description": "Subject, e.g. MQSim or Corallium"},
      "p": {**_STR, "description": "Predicate, e.g. 128K_seq_write"},
@@ -59,10 +65,7 @@ PUBLISH_SCHEMA = _schema(
      "coral": _STR,
      "rel": {"type": "string", "enum": ["root", "extends", "supersedes", "merges"]},
      "parents": {**_ARR, "description": "Node ids this builds on or replaces"},
-     "type": {"type": "string", "enum": ["claim", "anomaly", "question", "decision", "task", "suggestion", "link"]},
-     "action": {"type": "string", "enum": ["merge", "retire", "link", "split", "reindex"],
-                "description": "suggestion only: the maintenance action you propose"},
-     "targets": {**_ARR, "description": "suggestion only: node ids the proposed action would touch"},
+     "type": {"type": "string", "enum": ["claim", "anomaly", "question", "decision", "task", "link"]},
      "topics": _ARR,
      "significance": {**_INT, "description": "1-5: how much it would matter if true (not how sure you are)"},
      "note": {**_STR, "description": "Caveats, or for anomalies: prediction / observation / deviation / probe"},
@@ -84,6 +87,26 @@ PUBLISH_SCHEMA = _schema(
      "volatility": {"type": "string", "enum": ["static", "slow", "fast", "live"],
                     "description": "How fast this fact expires: static (never) / slow (180d) / fast (1d) / live (1h)"}},
     ("s", "p", "o"))
+
+SUGGEST_SCHEMA = _schema(
+    "coral_suggest",
+    "Propose a maintenance action on the coral — merge, retire, link, split or reindex — without "
+    "performing it. Use this the moment you notice a duplicate, an administrative record, a node in "
+    "the wrong place, or a proposition that needs splitting; do not leave the judgement in your final "
+    "answer where it dies with the session. The proposal becomes a node (type=suggestion) that anyone "
+    "can see, vote down with `redundant`, or execute. You cannot execute maintenance: scan/merge/retire/"
+    "repin are operator actions, deliberately absent from this plugin, because a curator deleting "
+    "mid-task has no one to check them. targets must be ids you actually read, not ids you guessed.",
+    {"action": {"type": "string", "enum": ["merge", "retire", "link", "split", "reindex"],
+                "description": "what should happen: merge (two nodes say one thing) / retire (a record, "
+                               "not a proposition) / link (an orphan belongs under a branch) / split "
+                               "(one node carries two propositions) / reindex (wrong predicate or topic)"},
+     "targets": {**_ARR, "description": "Node ids the action would touch (1 for retire/link, 2+ for merge)"},
+     "why": {**_STR, "description": "What breaks if nothing is done. One sentence, concrete."},
+     "topic": {**_STR, "description": "Topic the proposal belongs to (default maintenance)"},
+     "significance": {**_INT, "description": "1-5, how much the mess costs (default 2)"},
+     "coral": _STR},
+    ("action", "targets", "why"))
 
 TIP_SCHEMA = _schema(
     "coral_tip",
@@ -156,6 +179,14 @@ def _h_publish(args, **kw):
         action=str(args.get("action") or ""), targets=args.get("targets") or [])
 
 
+def _h_suggest(args, **kw):
+    return _c.suggest(str(args.get("action") or ""), args.get("targets") or [],
+                      str(args.get("why") or ""),
+                      topics=[str(args.get("topic") or "maintenance")],
+                      significance=int(args.get("significance") or 2),
+                      coral=str(args.get("coral") or ""))
+
+
 def _h_tip(args, **kw):
     return _c.tip(str(args.get("topic") or ""), coral=str(args.get("coral") or ""))
 
@@ -184,6 +215,7 @@ def _h_release(args, **kw):
 _TOOLS = (
     ("coral_find", FIND_SCHEMA, _h_find, "🪸"),
     ("coral_publish", PUBLISH_SCHEMA, _h_publish, "✍️"),
+    ("coral_suggest", SUGGEST_SCHEMA, _h_suggest, "🧹"),
     ("coral_tip", TIP_SCHEMA, _h_tip, "🌊"),
     ("coral_vote", VOTE_SCHEMA, _h_vote, "⚖️"),
     ("coral_state", STATE_SCHEMA, _h_state, "🔄"),

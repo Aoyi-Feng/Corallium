@@ -35,6 +35,18 @@ def wait_health(port, timeout=15.0):
     raise RuntimeError(f"server on {port} never became healthy")
 
 
+def maint(port, ep, payload):
+    """Call a mutating maintenance endpoint as a client would: if nobody holds
+    the lease (§20.10), take it and retry once. The refusal itself is tested
+    separately in [32]."""
+    code, body = req(port, ep, payload)
+    if code == 409 and "lease" in str(body.get("error", "")):
+        req(port, "/maintenance/lease",
+            {"author": payload.get("author") or "curator", "ttl": 3600})
+        code, body = req(port, ep, payload)
+    return code, body
+
+
 def start(server, root, port, env_extra=None, extra=None):
     from _launch import argv, env
     args = argv(server, *(extra if extra is not None else ["--root", root]))
@@ -79,6 +91,7 @@ def main():
 
     try:
         srv = start(a.server, root, a.port)
+        req(a.port, "/maintenance/lease", {"author": "curator", "ttl": 3600})
 
         # 1 — concurrent identical publishes
         payload = {"s": "T", "p": "same", "o": "v", "author": "a"}
@@ -369,7 +382,7 @@ def main():
             return None
 
         before = (status_of("571", A), status_of("903", B))
-        code_merge = req(a.port, "/maintenance/merge",
+        code_merge = maint(a.port, "/maintenance/merge",
                          {"keep": A, "drop": B, "reason": "geometry 70%, cache 30%",
                           "author": "curator"})[0]
         after = (status_of("571", A), status_of("903", B))
@@ -526,7 +539,7 @@ def main():
         k2 = req(a.port, "/nodes", {"s": "M", "p": "cache", "o": "the write cache is 64 MB per device today",
                                     "author": "a", "topics": ["M"], "force": True,
                                     "why_new": "测试用：与上一条几乎同文"})[1]["node"]
-        req(a.port, "/maintenance/merge", {"keep": k1["id"], "drop": k2["id"],
+        maint(a.port, "/maintenance/merge", {"keep": k1["id"], "drop": k2["id"],
                                            "reason": "same fact, tested", "author": "curator"})
         sc3 = req(a.port, "/maintenance/scan")[1]
         dup_hit = any({k1["id"], k2["id"]} <= {d.get("a"), d.get("b")} for d in sc3["duplicates"])
@@ -550,12 +563,12 @@ def main():
                                "author": "a", "topics": ["M"], "parents": [par["id"]]})
         sc4 = req(a.port, "/maintenance/scan")[1]
         listed = {x["id"] for x in sc4.get("admin", [])}
-        code_refuse = req(a.port, "/maintenance/retire",
-                          {"id": adm["id"], "reason": "admin", "author": "cur"})[0]
+        code_refuse = maint(a.port, "/maintenance/retire",
+                          {"id": adm["id"], "reason": "admin", "author": "curator"})[0]
         req(a.port, f"/nodes/{adm['id']}/replies",
             {"kind": "junk", "author": "b", "artifact": "t", "text": "record, not a claim"})
-        code_ok = req(a.port, "/maintenance/retire",
-                      {"id": adm["id"], "reason": "admin", "author": "cur"})[0]
+        code_ok = maint(a.port, "/maintenance/retire",
+                      {"id": adm["id"], "reason": "admin", "author": "curator"})[0]
         ok = (adm["id"] in listed and par["id"] not in listed
               and sc4["counts"]["admin"] >= 1 and sc4["counts"]["admin_ratio"] > 0
               and code_refuse == 409 and code_ok in (200, 201))
@@ -581,8 +594,8 @@ def main():
         sc5 = req(a.port, "/maintenance/scan")[1]
         in_scan = any(s["id"] == sg["id"] for s in sc5.get("suggestions", []))
         in_tip = sg["id"] in {t["id"] for t in req(a.port, "/tip?topic=M")[1]["tips"]}
-        req(a.port, "/maintenance/merge", {"keep": x["id"], "drop": y["id"],
-                                           "reason": "同一条事实", "author": "cur",
+        maint(a.port, "/maintenance/merge", {"keep": x["id"], "drop": y["id"],
+                                           "reason": "同一条事实", "author": "curator",
                                            "suggestion": sg["id"]})
         sc6 = req(a.port, "/maintenance/scan")[1]
         closed = not any(s["id"] == sg["id"] for s in sc6.get("suggestions", []))
@@ -608,13 +621,13 @@ def main():
                                       "force": True, "why_new": "测试用"})[1]["node"]
         req(a.port, f"/nodes/{lone['id']}/replies",
             {"kind": "junk", "author": "b", "artifact": "t", "text": "不重要"})
-        code_lone = req(a.port, "/maintenance/retire",
-                        {"id": lone["id"], "reason": "junk", "author": "cur"})[0]
+        code_lone = maint(a.port, "/maintenance/retire",
+                        {"id": lone["id"], "reason": "junk", "author": "curator"})[0]
         twin = req(a.port, "/nodes", {"s": "ONE", "p": "only_copy", "o": "这句话只存在一次，删了就没了。",
                                       "author": "c", "topics": ["M"], "significance": 1,
                                       "force": True, "why_new": "同一句的副本，用来证明撤一条不丢知识"})[1]["node"]
-        code_twin = req(a.port, "/maintenance/retire",
-                        {"id": lone["id"], "reason": "junk", "author": "cur"})[0]
+        code_twin = maint(a.port, "/maintenance/retire",
+                        {"id": lone["id"], "reason": "junk", "author": "curator"})[0]
         ok = code_lone == 409 and code_twin == 200
         print(f"[29] lossless retire: only_copy={code_lone} with_twin={code_twin} "
               f"twin={twin['id'][:8]} -> {'PASS' if ok else 'FAIL'}")
@@ -631,6 +644,7 @@ def main():
         open(src, "w").write("X = 1\n")
         open(os.path.join(root2, "coral.yaml"), "w").write(f"name: repo-test\nrepo: {repo}\n")
         srv = start(a.server, root2, a.port + 1)
+        req(a.port + 1, "/maintenance/lease", {"author": "curator", "ttl": 3600})
         n = req(a.port + 1, "/nodes", {"s": "R", "p": "mod_value", "o": "模块里的常数是 1",
                                        "author": "a", "topics": ["M"], "significance": 2,
                                        "refs": [{"path": src}]})[1]["node"]
@@ -640,8 +654,8 @@ def main():
         os.makedirs(os.path.join(repo, "src"), exist_ok=True)
         os.rename(src, os.path.join(repo, "src", "mod.py"))
         v1 = req(a.port + 1, f"/verify?node={n['id']}")[1]["refs"][0]["state"]
-        rp = req(a.port + 1, "/maintenance/repin",
-                 {"from": "pkg/mod.py", "to": "src/mod.py", "author": "cur",
+        rp = maint(a.port + 1, "/maintenance/repin",
+                 {"from": "pkg/mod.py", "to": "src/mod.py", "author": "curator",
                   "reason": "dir rename"})[1]
         v2 = req(a.port + 1, f"/verify?node={n['id']}")[1]["refs"][0]["state"]
         same = req(a.port + 1, f"/reviews?claim={n['id']}")[1]["node"]["id"] == n["id"]
@@ -668,12 +682,36 @@ def main():
                                         "author": "b", "topics": ["M"], "significance": 4,
                                         "rel": "extends", "parents": [d1["id"]],
                                         "force": True, "why_new": "test: same text, different edge"})[1]["node"]
-        code_dup_retire = req(a.port + 1, "/maintenance/retire",
-                              {"id": d1["id"], "reason": "duplicate", "author": "cur"})[0]
+        code_dup_retire = maint(a.port + 1, "/maintenance/retire",
+                              {"id": d1["id"], "reason": "duplicate", "author": "curator"})[0]
         ok = code_dup_retire == 200
         print(f"[31] duplicate retire at ★4: {code_dup_retire} -> {'PASS' if ok else 'FAIL'}")
         if not ok:
             fails.append(31)
+        # 32 — maintenance is serial: one curator at a time, and proposing is
+        #      still allowed to everyone while it is held.
+        req(a.port + 1, "/maintenance/release", {"author": "curator"})
+        req(a.port + 1, "/maintenance/lease", {"author": "alice", "ttl": 600})
+        lone = req(a.port + 1, "/nodes", {"s": "SER", "p": "serial_check",
+                                          "o": "这条节点只用来测试维护锁", "author": "z",
+                                          "topics": ["M"], "significance": 1})[1]["node"]
+        req(a.port + 1, f"/nodes/{lone['id']}/replies",
+            {"kind": "junk", "author": "b", "artifact": "t", "text": "test fixture"})
+        code_bob = req(a.port + 1, "/maintenance/retire",
+                       {"id": lone["id"], "reason": "junk", "author": "bob"})[0]
+        sug = req(a.port + 1, "/maintenance/lease", {"author": "bob", "ttl": 600})[0]
+        props = req(a.port + 1, "/nodes", {"s": "SER", "p": "suggest:retire", "o": "still allowed",
+                                           "type": "suggestion", "action": "retire",
+                                           "targets": [lone["id"]], "author": "bob",
+                                           "topics": ["M"]})[0]
+        req(a.port + 1, "/maintenance/release", {"author": "alice"})
+        take = req(a.port + 1, "/maintenance/lease", {"author": "bob", "ttl": 600})[1]
+        ok = (code_bob == 409 and sug == 409 and props == 201
+              and take.get("author") == "bob")
+        print(f"[32] serial maintenance: second_curator={code_bob} proposal_while_held={props} "
+              f"after_release={take.get('author')} -> {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            fails.append(32)
         stop(srv)
         srv = None
         shutil.rmtree(root2, ignore_errors=True)
