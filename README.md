@@ -33,6 +33,8 @@ into rules an agent can execute:
 | Retraction | `withdrawn` + cascading `suspect` on downstream nodes |
 | Priority | monotonic `seq` |
 | Negative results | `dead_end` — first-class, not buried |
+| Scoping | `--root` + "N outside scope", never silently filtered |
+| Separate disciplines | one coral per knowledge domain, not one giant graph |
 
 ## The record is immutable
 
@@ -42,6 +44,27 @@ before, and why did we stop believing it*.
 
 Named after coral: new polyps grow on the dead skeleton of the previous ones. The
 branching pattern **is** the history.
+
+## Independence is context, not identity
+
+The question is not *who* verified a claim — it is *what they had seen when they did*.
+A reviewer that reads the claim first and then agrees is anchoring, not validating.
+
+So a `replicated` vote must come with a `prior`: a node the reviewer published **before**
+looking at the claim. Without one it is scored as a guess, not as replication.
+
+Identity is only used to stop the same context voting twice. It is forgeable, and that is
+accepted — **you can fake a name, you cannot fake a context.**
+
+## Deployment
+
+Two forms, one protocol:
+
+- **Self-hosted** — `coral serve --port 8731`, data in `~/corals/<name>/`
+- **Remote** — point the client at a URL + token, store nothing locally
+
+If the server is unreachable, clients degrade to reading `nodes/` directly. They never
+silently drop a publish.
 
 ## Read this first
 
@@ -55,7 +78,8 @@ branching pattern **is** the history.
 - Not RAG — it compiles knowledge once instead of rediscovering it per query
 - Not a consensus system — evidence is graded, never averaged
 - Not a message bus — discoveries are *immediately accessible*, not pushed
+- Not one database for everything — different disciplines get different corals
 
 ## Status
 
-Protocol **v0.1.3**. Server and Hermes tool not yet implemented.
+Protocol **v0.1.4**. Server, CLI and Hermes tool not yet implemented.
