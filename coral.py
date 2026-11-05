@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Corallium — append-only knowledge graph. See PROTOCOL.md.
+"""Corallium — append-only knowledge graph. See PROTOCOL.md. (v0.1.1)
 
 Nodes are immutable files: nodes/<id>.json
 Edges live inside nodes (parents + rel). No database; scan is fast enough.

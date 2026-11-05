@@ -21,4 +21,4 @@ dead ends, the contradictions, and the claims that were later falsified.
 
 ## Status
 
-Protocol v0.2. Implementation in progress.
+Protocol v0.1.1. Implementation in progress.
