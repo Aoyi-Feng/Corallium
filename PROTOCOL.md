@@ -1,4 +1,4 @@
-# Corallium Protocol v0.1.12
+# Corallium Protocol v0.1.13
 
 > 名字来自珊瑚：新珊瑚虫长在旧骨骼上，一层层叠，分支形态本身就是历史。
 
@@ -211,6 +211,55 @@ GET /verify?node=<id>  # 单条
 
 ---
 
+## 3.4 写入前必须发生的事
+
+孤岛率和词表失控不会靠提醒解决。**agent 不会自查，除非不查就写不进去。**
+
+### 3.4.1 服务器替它查
+
+`POST /nodes` 在落盘之前做一次近邻检索（同一珊瑚内）：
+
+| 情况 | 返回 | 写入方必须做 |
+|---|---|---|
+| 最高相似度 < 0.62 | `201 created` | 无 |
+| 相似度 ≥ 0.62，且请求没带 `parents` | **`409 similar`** + 候选列表 | 三选一，不能装作没看见 |
+| 相似度 ≥ 0.62，带了 `parents` | `201`，并在响应里回 `linked_to` | 无 |
+| 带 `force: true` + 非空 `why_new` | `201`，节点打 `forced: true` | 事后可被问责 |
+
+409 的三种合法出路：
+
+```jsonc
+// 1. 我是在补充它 —— 垂直生长，这是默认期望
+{"s":…, "p":…, "o":…, "rel": "extends", "parents": ["<候选id>"]}
+// 2. 我这条取代它
+{"…", "rel": "supersedes", "parents": ["<候选id>"]}
+// 3. 真不是同一件事 —— 必须写清楚差在哪
+{"…", "force": true, "why_new": "这条讲的是写入时哈希，候选讲的是读取时校验"}
+```
+
+**相似度算的是 `p + o` 的字符三元组 Jaccard**，不是字符串相等。`impl:ref_support` 与 `impl:refs_pinned` 相似度 0.92，会被拦下——这正是它的用途。谓词换个名字不算新知识。
+
+### 3.4.2 垂直生长的判据
+
+一条新节点必须回答「它长在谁身上」：
+
+- 有父节点 → 合格，`rel` 说明是补充还是取代
+- 没有父节点，但 409 检查跑过且确实无近邻 → 合格，是真正的新根
+- 没有父节点、又有近邻、又 `force` 不写理由 → **不合格**
+
+「是不是新根」不由作者声明，由服务器当场检索决定。作者能声明的只有「为什么它虽然像、但不是同一件事」。
+
+### 3.4.3 `redundant`：对重复知识投的票
+
+新增票型 `redundant`，权重 **−2**，用于「这条已经在别处存在」：
+
+- 不要求 `prior`（重复是客观可见的，不需要独立性）
+- 要求 `artifact`：说出重复的是哪个节点 id
+- 被非作者投过 `redundant` 的节点，在 `find`/`tip` 里带 `merge_candidate: true`
+
+**它不删除任何东西**：合并是人的动作（`supersedes` + `merges`），票只负责让重复变得显眼。这也是排行榜与档案的区别——票降低的是「值不值得看」，不是「存不存在」。
+
+
 ## 4. 证据
 
 ### 4.1 证据是独立节点，不是 claim 里的数组
@@ -229,6 +278,23 @@ GET /verify?node=<id>  # 单条
   "ref": "重跑配置与 ref 一致，结果 571.0"
 }
 ```
+
+
+#### 4.1.1 一张票的身份
+
+`id = sha256(s,p,o,rel,parents)` 对命题是对的：同一句话就是同一条知识。
+**对票是错的**，因为票的主语不是命题，是「谁、凭什么、投了什么」。
+
+因此 review 节点的哈希输入额外包含 `author`、`prior`、`artifact`：
+
+| 输入 | 参与哈希 |
+|---|---|
+| claim / anomaly / question / decision / task | `s, p, o, rel, parents` |
+| review | 上面五项 **+ author + prior + artifact** |
+
+**不这样做的后果是静默的**：两个 agent 写了同样的评语（`"重复"`），第二次 `POST` 返回 `created:false`，票数只加一次，而两个人都以为自己的票记下了。并行实验里当场出现——四路 agent 中有两路给出同一个冗余判定，只有一票落账。
+
+同一个人投两次同样的票仍然合并（那是重复提交，不是两张票）。
 
 ### 4.2 分类与权重
 
@@ -1105,8 +1171,84 @@ hermes plugins enable corallium
 
 ---
 
+## 19. 清除的实现契约
+
+§14.3 说「必须真的删掉」。以下是「真的」的判据：任何一条不成立，purge 就只是把秘密挪到了另一个文件里。
+
+### 19.1 一个入口
+
+```
+POST /purge  {"id": "<node>", "reason": "...", "author": "..."}
+```
+
+| 情况 | 状态码 | 结果 |
+|---|---|---|
+| 正常 | 200 | 文件被墓碑覆盖，索引同步更新 |
+| 缺 `reason`（或全空白） | 400 | **一个字节都不写**——没有理由的墓碑只是一个人为的洞 |
+| `id` 不存在 | 404 | 什么都不做（打错 id 不是清除） |
+| 已经是墓碑 | 409 | 保留第一次的 `reason`；重复调用不产生第二个墓碑 |
+
+`reason` 是必填而不是可选：它是墓碑唯一的实质内容，也是下一个 agent 判断「要不要重建这条结论」的全部依据。
+
+### 19.2 墓碑的形状
+
+```
+{id, seq, ts, type: "tombstone", status: "withdrawn", purged_at, reason, author}
+```
+
+- **没有** `s`/`p`/`o`/`note`/`refs`/`method`/`topics`。不是留空，是键不存在。
+- `id`/`seq`/`ts` 沿用原值：墓碑占原节点在时间线上的位置，`since?cursor=` 才讲得通。
+- `author` 是**执行清除的人**，不是原作者——后者属于被销毁的 payload。
+- 文件必须**整份重写**（同目录临时文件 + `os.replace`），不是追加、不是打补丁。旧内容不留副本、不留 `.bak`。
+
+### 19.3 「删掉」有三层，缺一层就等于没删
+
+| 层 | 动作 | 只做前一层会怎样 |
+|---|---|---|
+| 文件 | 重写为墓碑 | — |
+| 索引 | `DELETE FROM nodes_fts WHERE nid=?` | FTS 行按插入计，`UPDATE nodes` 不碰它；旧文本仍可 `find` 到 |
+| 字节 | `PRAGMA secure_delete=ON` + FTS `optimize` + `wal_checkpoint(TRUNCATE)` | 明文还躺在 `index.db-wal` 和空闲页里，`grep` 就能捞出来 |
+
+**「查询查不到」不等于「字节不在了」**——这两件事之间差一个 checkpoint。验证方式不是调 `find`，是直接 grep：
+
+```bash
+curl -s -X POST .../purge -d '{"id":"...","reason":"含 API key"}'
+grep -c '<明文>' <root>/index.db*      # 必须全是 0
+```
+
+### 19.4 图不能断
+
+墓碑留在原地，所以 `parents: [<id>]` 不悬空。级联不写新代码：
+
+- `status: "withdrawn"` 让该 id 进入 `_dead_sets` 的 `dead` 集合；
+- 任何节点（含间接的）沿 `parents` 走到它 → 派生 `suspect`；
+- `tip` 不再返回墓碑本身。**但下游叶子仍会出现在 `tip` 里，只是带着 `derived_status: suspect`**——所以调用者看的是状态，不是「在不在 tips 里」。`suspect` 节点不得作为证据被引用（§14.4）。
+
+**下游只变 `suspect`，不自动 `withdrawn`。** 它们可能依然正确，只是失去了依据；这两件事必须分开（§14.4）。
+
+### 19.5 重建之后必须还是墓碑
+
+`rm index.db*` + 重启是文档承诺的无害操作。所以：墓碑必须从**文件**重建出来，而不是靠数据库里的残留状态。判据——重建后同时满足：
+
+1. 文件里 `type` 仍是 `tombstone`；
+2. 搜原明文 0 命中（墓碑只索引 `type` 与 `author`，`reason` 也不进全文索引）；
+3. 下游仍是 `suspect`；
+4. 再次 purge 仍是 409（墓碑没有被重建流程降级成普通节点）。
+
+### 19.6 顺带产生的两个性质（不要「修」掉）
+
+- 用同一 `(s,p,o,parents)` 重新发布被清除的节点 → `created: false`，返回的是墓碑。同一条秘密不能靠重发把墓碑顶掉。换个 `parents` 就会得到新 id，这挡不住——purge 防的是「同一份记录被复原」，不是「有人重新泄露一次」。
+- 墓碑会出现在 `since` 里，但不会出现在按 `topics` 过滤的结果里（`topics` 已销毁）。审计靠 `since` 全量拉取，不靠标签。
+
+### 19.7 purge 不是删除接口
+
+它只处理 §14.3 的那一种情况：**节点里被写进了凭证**。结论错了用 `supersedes`，路走不通用 `dead_end`，代码弃用用 `deprecated`——这些都留内容，因为「我们曾经相信 X，后来发现 Y」本身是资产。把 purge 当日常清理用，等于把 §14.2 的整段理由删掉。
+
+---
+
 ## 变更记录
 
+- **v0.1.13** — 写入前自检 §3.4（近邻 409 / extends 或 force+why_new）；`redundant` 票（−2，免 prior、需 artifact，触发 `merge_candidate`）；review 节点哈希含 author/prior/artifact（否则同文票静默合并）
 - **v0.1.12** — 新增 `refs` 文件引用（路径 + 写入时 sha256 + 行号）与 `GET /verify`；引用文件消失 → 节点派生 `suspect`；`changed` 只报警不降级
 - **v0.1.11** — 新增第六种节点类型 `task`（`o` 必须写完成条件；被放进某节点 `parents` 即视为关闭）与 `GET /tasks`；`task` 让「还没做的事」和「已知的事实」共用同一张图
 - **v0.1.10** — §16.1/16.2 定义珊瑚的完整结构（`coral.yaml`/`README.md`/`.gitignore`/`nodes/`/git）与 `--init` 脚手架；`tip` 改为真正沿 `parents` 找叶子；新增撤稿级联 `suspect`（仅显式撤稿传播，`supersedes` 替换不传播）与 `attempts>5` 进 `confirmed` 的门禁；`/health` 带珊瑚 `description`/`owner`/`protocol`

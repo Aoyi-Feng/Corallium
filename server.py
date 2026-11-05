@@ -12,6 +12,7 @@ Endpoints
     POST /nodes          {s,p,o,rel?,parents?,type?,status?,volatility?,topics?,method?,attempts?,note?,author}
     POST /claims         {question,ttl?,author}
     POST /nodes/{id}/replies  {kind,text,author,claim?}
+    POST /purge          {id,reason,author}   — 销毁内容，留墓碑 (PROTOCOL §14.3/§19)
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 import threading
@@ -33,8 +35,26 @@ DEFAULT_PORT = 8731
 
 # PROTOCOL §4.2. `agree` is 0 on purpose: LLMs agree by default, so counting
 # agreement turns confidence into a prose-quality contest.
+REQUIRED_ARTIFACT = {"refuted", "redundant"}
 WEIGHTS = {"adversarial": 4, "replicated": 3, "sourced": 2, "derived": 1,
-           "agree": 0, "refuted": -3}
+           "agree": 0, "refuted": -3, "redundant": -2}
+
+# A tombstone occupies the same slot the node occupied: same id, same seq, same
+# ts. Everything that was content is gone. `status: withdrawn` is not decoration:
+# `_dead_sets` keys on it, so children become `suspect` with no extra machinery.
+TOMBSTONE_KEYS = ("id", "seq", "ts", "type", "status", "purged_at", "reason", "author")
+
+
+class ApiError(Exception):
+    """An error that carries its own HTTP status, raised from inside a writer job.
+
+    `_run` must not flatten these into RuntimeError: "no such node" is a 404,
+    not a 500, and the caller decides what to do next from that code.
+    """
+
+    def __init__(self, code: int, message: str):
+        super().__init__(message)
+        self.code = code
 
 
 # ── storage ────────────────────────────────────────────────────────────────
@@ -60,6 +80,10 @@ class Store:
         c = sqlite3.connect(self.db_path, timeout=10)
         c.execute("PRAGMA journal_mode=WAL")
         c.execute("PRAGMA synchronous=NORMAL")
+        # Deleting a row is not the same as deleting bytes: freed pages keep the
+        # old payload readable in the file. A purge that leaves the secret in
+        # freelist pages has not purged anything.
+        c.execute("PRAGMA secure_delete=ON")
         return c
 
     def _init_schema(self, c: sqlite3.Connection) -> None:
@@ -103,7 +127,10 @@ class Store:
             except Exception:
                 continue
             c.execute(
-                "INSERT OR IGNORE INTO nodes VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO nodes VALUES (?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET seq=excluded.seq, ts=excluded.ts, "
+                "author=excluded.author, type=excluded.type, s=excluded.s, p=excluded.p, "
+                "o=excluded.o, status=excluded.status, topics=excluded.topics, body=excluded.body",
                 (n["id"], n.get("seq", 0), n.get("ts"), n.get("author"),
                  n.get("type"), n.get("s"), n.get("p"), n.get("o"),
                  n.get("status"), json.dumps(n.get("topics", [])),
@@ -174,6 +201,7 @@ class Store:
                 c.commit()
             except Exception as e:  # never leave the writer thread dead
                 box["error"] = f"{type(e).__name__}: {e}"
+                box["exc"] = e
                 try:
                     c.rollback()
                 except Exception:
@@ -183,11 +211,15 @@ class Store:
                 self._q.task_done()
 
     def _run(self, fn):
-        box = {"done": threading.Event(), "result": None, "error": None}
+        box = {"done": threading.Event(), "result": None, "error": None, "exc": None}
         self._q.put((fn, box))
         if not box["done"].wait(30):
             raise TimeoutError("writer queue timeout")
         if box["error"]:
+            # validation and "not found" must reach the caller as themselves,
+            # otherwise every bad request is indistinguishable from a crash
+            if isinstance(box["exc"], (ApiError, ValueError)):
+                raise box["exc"]
             raise RuntimeError(box["error"])
         return box["result"]
 
@@ -355,8 +387,10 @@ class Store:
         kind = v.get("kind") or v.get("p", "agree")
         w = WEIGHTS.get(kind, 0)
         caps = []
-        if kind in ("replicated", "adversarial", "refuted"):
-            if kind != "refuted" and not v.get("prior"):
+        if kind in ("replicated", "adversarial", "refuted", "redundant"):
+            # `refuted` and `redundant` stand on their own evidence: a counter-case
+            # or a duplicate is visible without having published anything first.
+            if kind not in ("refuted", "redundant") and not v.get("prior"):
                 caps.append("no-prior")
             if not (v.get("artifact") or v.get("method")):
                 caps.append("not-checkable")
@@ -457,6 +491,13 @@ class Store:
         for n in nodes:
             m = dict(n)
             m["derived_status"] = self.derive_status(n, alln, by_id, dead, replaced)
+            # `scores[...]["votes"]` is a count, not a list — read the timeline.
+            red = [v for v in alln
+                   if v.get("type") == "review" and v.get("claim") == n["id"]
+                   and (v.get("kind") or v.get("p")) == "redundant"
+                   and v.get("author") != n.get("author")]
+            if red:
+                m["merge_candidate"] = True
             if n.get("refs"):
                 m["refs"] = len(n["refs"])
                 m["refs_missing"] = sum(1 for r in n["refs"] if r.get("missing"))
@@ -564,6 +605,59 @@ class Store:
                 "changed": sum(1 for x in out if x["state"] == "changed"),
                 "missing": sum(1 for x in out if x["state"] == "missing")}
 
+    @staticmethod
+    def _grams(text: str, n: int = 3) -> set:
+        t = " ".join(str(text or "").lower().split())
+        t = t.replace(" ", "")
+        return {t[i:i + n] for i in range(max(0, len(t) - n + 1))}
+
+    def _candidates(self, p: str, o: str, limit: int = 30) -> list[dict]:
+        """Cheap prefilter through the FTS index, then trigram Jaccard.
+
+        The index answers "which nodes share a token", which at 500k is a few
+        hundred microseconds; the Jaccard pass only ever sees the handful it
+        returns. Scanning every node to decide whether to reject a write would
+        make publishing O(coral), and publishing is the thing we want to be easy.
+        """
+        c = self._conn()
+        terms = [w for w in re.findall(r"[A-Za-z0-9_]{3,}", f"{p} {o}")][:6]
+        rows = []
+        if terms:
+            q = " OR ".join('"' + t + '"' for t in terms)
+            try:
+                rows = c.execute(
+                    "SELECT nid FROM nodes_fts WHERE nodes_fts MATCH ? LIMIT ?",
+                    (q, limit)).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+        ids = list(dict.fromkeys(r[0] for r in rows))
+        if not ids:  # CJK text has no [A-Za-z0-9_]{3,} tokens; fall back to a scan
+            ids = [r[0] for r in c.execute("SELECT id FROM nodes LIMIT ?", (limit * 8,))]
+        marks = ",".join("?" * len(ids))
+        got = [json.loads(b) for (b,) in c.execute(
+            f"SELECT body FROM nodes WHERE id IN ({marks})", ids).fetchall()] if ids else []
+        c.close()
+        mine_o, mine_po = self._grams(o), self._grams(f"{p} {o}")
+        out = []
+        for n in got:
+            if n.get("type") in ("review", "tombstone"):
+                continue
+            theirs_o = self._grams(n.get("o", ""))
+            theirs_po = self._grams(f"{n.get('p','')} {n.get('o','')}")
+            if not theirs_o or not mine_o:
+                continue
+            # Two axes, because the same knowledge recorded under a different
+            # predicate name is what this gate is most needed for: `ref_support`
+            # vs `refs_pinned` share almost no predicate grams but the object is
+            # identical. Judging on `p + o` alone scores that pair below 0.62.
+            j = max(len(mine_o & theirs_o) / len(mine_o | theirs_o),
+                    len(mine_po & theirs_po) / len(mine_po | theirs_po))
+            if j >= 0.45:
+                out.append({"id": n["id"], "p": n.get("p"), "o": n.get("o"),
+                            "status": n.get("status"), "similarity": round(j, 3)})
+        out.sort(key=lambda x: -x["similarity"])
+        return out[:5]
+
     def add_node(self, payload: dict) -> dict:
         def job(c):
             s, p, o = payload.get("s"), payload.get("p"), payload.get("o")
@@ -571,12 +665,38 @@ class Store:
                 raise ValueError("s, p, o are required")
             rel = payload.get("rel", "root")
             parents = payload.get("parents") or []
-            blob = json.dumps([s, p, o, rel, sorted(parents)], ensure_ascii=False)
+            # A vote's identity includes who cast it and what it rests on.
+            # Without author+artifact in the hash, two agents who write the same
+            # words collapse into one vote and the second disappears silently —
+            # observed live when two of four parallel agents cast the same
+            # `redundant` verdict.
+            if payload.get("type") == "review":
+                blob = json.dumps([s, p, o, rel, sorted(parents),
+                                   payload.get("author", ""), payload.get("prior", ""),
+                                   payload.get("artifact", "")], ensure_ascii=False)
+            else:
+                blob = json.dumps([s, p, o, rel, sorted(parents)], ensure_ascii=False)
             nid = hashlib.sha256(blob.encode()).hexdigest()[:12]
 
             hit = c.execute("SELECT body FROM nodes WHERE id=?", (nid,)).fetchone()
             if hit:  # idempotent: concurrent identical publishes collapse
                 return {"created": False, "node": json.loads(hit[0])}
+
+            # §3.4.1 — the gate that stops the graph from spreading sideways.
+            # It only runs for propositions: a review points at its claim by
+            # construction, and a task is an obligation, not a finding.
+            ntype = payload.get("type", "claim")
+            gateable = ntype in ("claim", "anomaly", "question", "decision")
+            if gateable and not parents:
+                cand = self._candidates(p, o)
+                top = cand[0] if cand else None
+                if top and top["similarity"] >= 0.62 and not payload.get("force"):
+                    return {"conflict": "similar", "candidates": cand,
+                            "hint": "link it (rel=extends|supersedes, parents=[id]) "
+                                    "or pass force=true with why_new"}
+                if top and top["similarity"] >= 0.62 and not (payload.get("why_new") or "").strip():
+                    raise ValueError("force=true needs a non-empty why_new: "
+                                     "say how this differs from " + top["id"])
 
             seq = int(c.execute("SELECT coalesce(max(seq),0) FROM nodes").fetchone()[0]) + 1
             node = {
@@ -601,6 +721,9 @@ class Store:
             for k in ("claim", "prior", "kind", "artifact"):
                 if payload.get(k):
                     node[k] = payload[k]
+            if payload.get("force"):
+                node["forced"] = True
+                node["why_new"] = payload.get("why_new", "")
             if payload.get("refs"):
                 node["refs"] = payload["refs"]
                 self._pin_refs(node)
@@ -654,6 +777,100 @@ class Store:
                        "p": payload.get("kind", "confirm"),
                        "o": payload.get("text", "")})
         return self.add_node(merged)
+
+    def purge(self, node_id: str, reason: str, author: str) -> dict:
+        """Destroy one node's payload, keep its place in the graph (PROTOCOL §14.3).
+
+        Nodes are immutable; this is the single sanctioned exception, and only
+        for secrets. Three things must all be true afterwards, or the purge is a
+        lie:
+
+          1. the payload is not in the file (rewritten, not appended to),
+          2. the payload is not in the index (FTS rows deleted, not shadowed),
+          3. the id still resolves, so `parents: [id]` does not dangle.
+
+        (3) is why this is a tombstone and not a delete: a child that lost its
+        parent silently becomes an orphan that still looks confirmed. Status
+        `withdrawn` feeds `_dead_sets`, which is what turns those children
+        `suspect` — the retraction cascade falls out of the state machine instead
+        of being re-implemented here.
+        """
+        node_id = (node_id or "").strip()
+        reason = (reason or "").strip()
+        author = (author or "").strip() or "unknown"
+        # Validate outside the queue: a missing reason is the caller's mistake,
+        # and must not reach the index or the disk at all.
+        if not node_id:
+            raise ApiError(400, "id is required")
+        if not reason:
+            raise ApiError(400, "reason is required: a tombstone without a reason "
+                                "is an unexplained hole in the record")
+
+        def job(c):
+            row = c.execute("SELECT body FROM nodes WHERE id=?", (node_id,)).fetchone()
+            if not row:
+                raise ApiError(404, f"no such node: {node_id}")
+            old = json.loads(row[0])
+            if old.get("type") == "tombstone":
+                # second purge is a conflict, not a second tombstone: the first
+                # reason is the record, and overwriting it would erase the audit
+                raise ApiError(409, f"already a tombstone: {node_id}")
+
+            tomb = {
+                "id": old["id"], "seq": old.get("seq", 0), "ts": old.get("ts"),
+                "type": "tombstone", "status": "withdrawn",
+                "purged_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+                "reason": reason, "author": author,
+            }
+            assert tuple(tomb) == TOMBSTONE_KEYS  # no field creeps back in
+
+            # file first: it is the truth, as on the write path. Same directory,
+            # so os.replace is atomic — a reader sees the old node or the
+            # tombstone, never half of each.
+            path = self.nodes_dir / f"{old['id']}.json"
+            tmp = path.with_name(path.name + ".purge")
+            fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o644)
+            with os.fdopen(fd, "w") as fh:
+                json.dump(tomb, fh, ensure_ascii=False, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+
+            body = json.dumps(tomb, ensure_ascii=False)
+            c.execute(
+                "UPDATE nodes SET author=?, type=?, s=NULL, p=NULL, o=NULL, "
+                "status=?, topics=?, body=? WHERE id=?",
+                (author, "tombstone", "withdrawn", json.dumps([]), body, old["id"]),
+            )
+            # FTS rows are per-insert, not per-id: the old text lives in its own
+            # row, and UPDATE nodes does not touch it. Delete by nid; a bare
+            # re-insert would leave the secret searchable forever.
+            c.execute("DELETE FROM nodes_fts WHERE nid=?", (old["id"],))
+            self._fts_put(c, tomb)
+            return {"purged": True, "node": tomb}
+
+        r = self._run(job)
+        self._scrub()
+        return r
+
+    def _scrub(self) -> None:
+        """Overwrite what the delete left behind. Best effort, after commit.
+
+        SQLite does not zero freed pages (hence `secure_delete`), FTS5 keeps the
+        deleted text in unmerged segments until `optimize`, and the WAL still
+        holds the pre-purge page images until a truncating checkpoint. None of
+        these change what `find` returns — they change what `grep index.db`
+        finds, which for a secret is the whole point.
+        """
+        try:
+            c = self._conn()
+            if getattr(self, "fts_ok", False):
+                c.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('optimize')")
+            c.commit()
+            c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            c.close()
+        except sqlite3.Error:
+            pass
 
 
 # ── http ───────────────────────────────────────────────────────────────────
@@ -774,6 +991,10 @@ def make_handler(corals: dict, read_token: str, write_token: str, default: str |
                     return
                 if ep == "/nodes":
                     r = store.add_node(payload)
+                    if r.get("conflict") == "similar":
+                        # 409, not 201: the write did not happen and the caller
+                        # has to decide what this node is *in relation to*.
+                        return self._send(409, r)
                     return self._send(201 if r["created"] else 200, r)
                 if ep == "/claims":
                     return self._send(200, store.claim(
@@ -782,7 +1003,13 @@ def make_handler(corals: dict, read_token: str, write_token: str, default: str |
                 if ep.startswith("/nodes/") and ep.endswith("/replies"):
                     nid = ep[len("/nodes/"):-len("/replies")]
                     return self._send(201, store.reply(nid, payload))
+                if ep == "/purge":
+                    r = store.purge(payload.get("id", ""), payload.get("reason", ""),
+                                    payload.get("author", "unknown"))
+                    return self._send(200, r)
                 return self._send(404, {"error": "not found"})
+            except ApiError as e:  # carries its own status: 400 / 404 / 409
+                return self._send(e.code, {"error": str(e)})
             except ValueError as e:  # bad input is the caller's fault
                 return self._send(400, {"error": str(e)})
             except Exception as e:
