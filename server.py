@@ -279,24 +279,15 @@ class Store:
         c = self._conn()
         alln = [json.loads(b) for (b,) in c.execute("SELECT body FROM nodes").fetchall()]
         c.close()
+        scores = self._scores(alln)
         out = []
         for n in nodes:
             m = dict(n)
             m["derived_status"] = self.derive_status(n, alln)
             if n.get("type") == "claim":
-                votes = [v for v in alln if v.get("type") == "review"
-                         and v.get("claim") == n["id"] and v.get("author") != n.get("author")]
-                total = 0
-                for v in votes:
-                    kind = v.get("kind") or v.get("p", "agree")
-                    w = WEIGHTS.get(kind, 0)
-                    if kind in ("replicated", "adversarial", "refuted"):
-                        if ((kind != "refuted" and not v.get("prior"))
-                                or not (v.get("artifact") or v.get("method"))):
-                            w = 1 if w > 0 else -1
-                    total += w
-                m["score"] = total
-                m["votes"] = len(votes)
+                sc = scores.get(n["id"], {"score": 0, "votes": 0})
+                m["score"] = sc["score"]
+                m["votes"] = sc["votes"]
             out.append(m)
         return out
 
@@ -316,59 +307,87 @@ class Store:
         tips = [n for n in rows if n["id"] not in parented and n.get("status") != "withdrawn"]
         return self.annotate(tips or rows)
 
-    def reviews(self, claim_id: str) -> dict:
-        """Every vote is its own immutable node, so the list is a timeline:
-        ts + author + kind + text + the `prior` that proves independence."""
+    @staticmethod
+    def _gate(v: dict, target_author: str | None):
+        """Base weight from kind, then the two gates. Returns (weight, caps, kind)."""
+        kind = v.get("kind") or v.get("p", "agree")
+        w = WEIGHTS.get(kind, 0)
+        caps = []
+        if kind in ("replicated", "adversarial", "refuted"):
+            # `prior` proves a replicator had not seen the conclusion first.
+            # A refutation needs no warning shot: the counter-case is the point.
+            if kind != "refuted" and not v.get("prior"):
+                caps.append("no-prior")
+            if not (v.get("artifact") or v.get("method")):
+                caps.append("not-checkable")
+            if caps:
+                w = 1 if w > 0 else -1
+        return w, caps, kind
+
+    def _scores(self, alln: list[dict]) -> dict:
+        """Score every node from the vote graph. Nothing is stored.
+
+        Votes on votes are allowed, but the recursion stops after one level:
+        a vote's own weight may be damped by what others said about it, while
+        votes *on those meta-votes* are recorded and ignored for scoring.
+        Without a floor the graph has no fixed point (A rates B, B rates A).
+        """
+        reviews = [n for n in alln if n.get("type") == "review"]
+        by_target: dict[str, list[dict]] = {}
+        for r in reviews:
+            by_target.setdefault(r.get("claim"), []).append(r)
+
+        authors = {n["id"]: n.get("author") for n in alln}
+        out: dict[str, dict] = {}
+        for n in alln:  # reviews are scored too, so votes on a vote are listable
+            votes = []
+            total = 0.0
+            for v in by_target.get(n["id"], []):
+                w, caps, kind = self._gate(v, n.get("author"))
+                meta = [m for m in by_target.get(v["id"], [])
+                        if m.get("author") != v.get("author")]
+                meta_score = 0.0
+                for m in meta:
+                    mw, mcaps, mkind = self._gate(m, v.get("author"))
+                    meta_score += mw
+                # -4 → ×0.5, -8 → ×0.33, floored at ×0.25 so a heavily
+                # contested piece of evidence still leaves a trace.
+                mult = 1.0 / (1.0 + max(0.0, -meta_score) / 4.0)
+                mult = max(mult, 0.25)
+                eff = w * mult
+                counted = v.get("author") != n.get("author")
+                votes.append({
+                    "id": v["id"], "seq": v.get("seq"), "ts": v.get("ts"),
+                    "author": v.get("author"), "kind": kind, "text": v.get("o", ""),
+                    "prior": v.get("prior"), "artifact": v.get("artifact"),
+                    "weight": w, "capped": caps,
+                    "meta_score": meta_score, "meta_votes": len(meta),
+                    "multiplier": round(mult, 2),
+                    "effective": round(eff, 2) if counted else 0,
+                    "counted": counted,
+                })
+                if counted:
+                    total += eff
+            if votes:
+                out[n["id"]] = {"score": round(total, 2), "votes": len(votes),
+                                "detail": votes}
+        return out
+
+    def reviews(self, target_id: str) -> dict:
+        """The vote list for any node — claim or another vote — as a timeline."""
         c = self._conn()
-        rows = c.execute(
-            "SELECT body FROM nodes WHERE type='review' ORDER BY seq"
-        ).fetchall()
-        target = c.execute("SELECT body FROM nodes WHERE id=?", (claim_id,)).fetchone()
+        alln = [json.loads(b) for (b,) in c.execute("SELECT body FROM nodes").fetchall()]
         c.close()
+        target = next((n for n in alln if n["id"] == target_id), None)
         if not target:
-            return {"error": f"no such node: {claim_id}"}
-        claim = json.loads(target[0])
-        votes = []
-        for (b,) in rows:
-            n = json.loads(b)
-            if n.get("claim") != claim_id:
-                continue
-            kind = n.get("kind") or n.get("p", "agree")
-            w = WEIGHTS.get(kind, 0)
-            # Two gates. A vote only carries full weight when the reviewer had
-            # not seen the conclusion (prior) AND left something another agent
-            # could actually check (artifact: command, script, dataset hash).
-            # Otherwise it is an opinion, and opinions are worth 1 or 0.
-            if kind in ("replicated", "adversarial", "refuted"):
-                checks = []
-                # `prior` proves a replicator had not seen the conclusion. A
-                # refutation needs no such thing: the counter-case is the point.
-                if kind != "refuted" and not n.get("prior"):
-                    checks.append("no-prior")
-                if not (n.get("artifact") or n.get("method")):
-                    checks.append("not-checkable")
-                if checks:
-                    w = 1 if w > 0 else -1
-                capped = checks
-            else:
-                capped = []
-            if n.get("author") == claim.get("author"):
-                votes.append({"id": n["id"], "seq": n.get("seq"), "ts": n.get("ts"),
-                              "author": n.get("author"), "kind": kind, "text": n.get("o", ""),
-                              "prior": n.get("prior"), "artifact": n.get("artifact"),
-                              "weight": w, "capped": capped,
-                              "counted": False, "reason": "self-vote"})
-                continue
-            votes.append({"id": n["id"], "seq": n.get("seq"), "ts": n.get("ts"),
-                          "author": n.get("author"), "kind": kind, "text": n.get("o", ""),
-                          "prior": n.get("prior"), "artifact": n.get("artifact"),
-                          "weight": w, "capped": capped, "counted": True})
-        score = sum(v["weight"] for v in votes if v["counted"])
-        kinds = {}
-        for v in votes:
+            return {"error": f"no such node: {target_id}"}
+        sc = self._scores(alln).get(target_id, {"score": 0, "votes": 0, "detail": []})
+        tally: dict[str, int] = {}
+        for v in sc["detail"]:
             if v["counted"]:
-                kinds[v["kind"]] = kinds.get(v["kind"], 0) + 1
-        return {"claim": claim, "score": score, "votes": votes, "tally": kinds}
+                tally[v["kind"]] = tally.get(v["kind"], 0) + 1
+        return {"node": target, "score": sc["score"], "tally": tally,
+                "votes": sc["detail"]}
 
     def max_seq(self) -> int:
         c = self._conn()
