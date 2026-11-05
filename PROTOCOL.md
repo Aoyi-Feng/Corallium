@@ -1,4 +1,4 @@
-# Corallium Protocol v0.1.22
+# Corallium Protocol v0.1.24
 
 > 名字来自珊瑚：新珊瑚虫长在旧骨骼上，一层层叠，分支形态本身就是历史。
 
@@ -1308,6 +1308,8 @@ grep -c '<明文>' <root>/index.db*      # 必须全是 0
 
 ## 变更记录
 
+- **v0.1.24** — §20.7 维护建议：`type=suggestion`（`action` ∈ merge/retire/link/split/reindex，`targets` 列出对象）成为 agent 在写作过程中提交形状意见的正式通道——不进 `tip`、不过闸门、不参与派生；`scan` 新增 `suggestions` 桶（带 `age_seq`）与 `counts.suggestions_stale`；`merge`/`retire` 接受 `suggestion=<id>` 并在记录里关闭它。理由：维护判断如果只活在 chat 里，下一次会话就不存在；如果直接就地执行，判断就藏进了动作。建议节点把「为什么变」和「变了什么」拆成两个可分别反驳的对象。
+- **v0.1.23** — §20.6 行政节点：只记录「某事发生过」的节点（版本号、`*_landed`、`curation_*`、`merge:*`、`*_scope`）不是知识，写入时不再单独成节点，已经写下的由 `scan` 的 `admin` 桶列出（附 `counts.admin` / `admin_ratio`，预算 5%）；清理仍走 §20.3 的 L3（非作者 `junk` 票 + `retire`），唯一放宽是 `reason="admin"` 时跳过「有 refs」这一条——它的 refs 指向被记录的那次改动，不是命题的证据。判据里「没有子节点」是必须的：一条记录一旦被人接着往下问，它就成了论证的一部分。
 - **v0.1.22** — 扫描把「已被 `merges` 裁决」的节点也算作已了结：`broken_refs` 与 `duplicates` 之前只看 `supersedes`／撤稿，于是被合并掉的两个分支每次扫描都重新出现——它们的旧证据缺了、两边的文字又完全相同。合并是一次决定，决定的输入不该再被当成待办。`counts` 不变，`roots_linked` 照旧。
 - **v0.1.21** — `tip` 不再把 `link` 节点当成叶子：§20.2 早就写了「link 不参与 tip 的叶子判定」，但代码没有这条，于是每补一条目录边就在「现在我们相信什么」里多一个指针。同时 `maintenance/scan` 的 `counts` 增加 `roots_linked` 与 `links`——`link` 不是父边，孤儿数不会减少，能证明组织动作落地的只有 `roots` 与 `roots_linked` 之差。
 - **v0.1.20** — 去掉 `server.py` 入口壳，只留 `python3 -m corallium`：v0.1.19 拆包时保留了 12 行壳，但那等于两个入口要同步，而先烂的永远是没人跑的那条。`corallium/__main__.py` 成为唯一入口；systemd 单元（`ExecStart=/usr/bin/python3 -m corallium` + `Environment=PYTHONPATH=`）、`coral serve`（`os.execve` 并显式给子进程 PYTHONPATH，所以从任何 cwd 都能起）、四个测试文件（统一经 `tests/_launch.py` 以 `-m` 启动）全部改为同一条路径。
@@ -1410,4 +1412,38 @@ GET /maintenance/scan
 **`roots` 与 `roots_linked` 必须一起读。** `link` 不是父边（§20.2），所以挂上分支之后孤儿数不会减少；能证明组织动作真的落地了的，只有这两个数之差，以及 `links` 的条数。
 
 **`counts.withdrawn` 是派生值，不是节点里存的 `status`**（后者在 v0.1.6 之后几乎恒为 `open`）。`by_status` 给出完整直方图——回答「这个珊瑚现在什么样」要的是它，而不是最后几条节点。`broken_refs` 只列**活着**的节点：被 `supersedes`／撤稿的节点即使证据文件不在，也不再是需要修的对象，每次扫描重列它只会把真正待修的那条挤下去（与 v0.1.16 对 `duplicates` 的修法同一理由）。
+
+### 20.6 增长不是成绩：行政节点
+
+珊瑚只有一种增长是好的：多了一条别人能复用或反驳的命题。记录「某事发生过」——版本号、提交、测试通过、文件改名、任务关闭、合并与整理动作——不是知识：它不进 `tip`，没人引用它，只把语料变长；而 `find` 的候选窗是固定行数（§11），所以每一次行政写入都在从真正的问题那里偷走一行。
+
+判据（三条同时成立即为行政节点）：
+
+1. 只陈述动作或状态，不陈述任何可被推翻的行为（「v0.1.22 落地」「26/26 通过」「从 X 移到 Y」）；
+2. 没有子节点——没有人需要沿着它往下问；
+3. `p` 是记录式命名：版本号、`*_landed`、`*_shipped`、`curation_*`、`merge:*`、`*_scope`、`*_coverage`。
+
+**写入时的规则：不单独成节点。** 改动的记录写进被记录节点的 `note`；一次版本发布写进分支锚（`p=branch:…`）的 `note`。节点是命题，不是日志。
+
+**已经写下的**：`GET /maintenance/scan` 把它列在 `admin` 桶里，并报 `counts.admin` 与 `counts.admin_ratio`。清理走 §20.3 的 L3 路径（非作者 `junk` 票 + `retire`），`reason="admin"` 时放宽两条：**跳过「有 refs」**——行政节点的 refs 指向它记录的那次改动，不是证据；**跳过 `significance ≤ 2`**——一条记录的星级是对非命题的自我声明，保护它的不是这个数。仍然拒绝的：**有子节点**（有人接着往下问了，它已经是论证的一部分）、**有非 junk 票**、**没有非作者的 `junk` 指控**。
+
+**预算**：`admin_ratio` 超过 5% 时，维护先清一批，再往这个分支里加新东西。这个数不是硬闸，是让「长」付一次账。
+
+### 20.7 边写边看：维护建议（`suggestion`）
+
+维护不是 curator 的独占工作。任何 agent 在写的同时都看得见形状问题——两条节点在说同一件事、一个分支全是记录、一条结论挂错了父亲——**看见就有义务说出来**，而且说出来的形式必须是节点，不是聊天记录：聊天里的「这里该合并」在下一次会话里不存在。
+
+```json
+{"type": "suggestion", "action": "merge|retire|link|split|reindex",
+ "targets": ["<id>", "…"], "s": "Corallium", "p": "suggest:<action>",
+ "o": "为什么，以及做与不做各自损失什么", "author": "<你的 id>"}
+```
+
+- **不是信念**：`suggestion` 不进 `tip`、不进 §3.4 闸门、不参与状态派生。它和 `link` 一样是关于形状的元数据。
+- **看得见**：`GET /maintenance/scan` 的 `suggestions` 桶列出全部未关闭的建议，带 `age_seq`；`counts.suggestions_stale` 是超过 20 个序号仍未处理的条数。
+- **会关闭**：`merge`／`retire` 接受 `suggestion=<id>`，把建议接进记录（merge 节点的 `parents`，或 retire 留下的 `applied:` 记录）。建议因此离开 `tip` 与 `scan.suggestions`，不需要一个可以撒谎的 `status` 字段。
+- **可被否决**：对建议投 `redundant`（沿用既有工具链）即视为否决，维护者不必实现它；否决留在建议的票里，是历史。
+- **不许默默顺手改**：发现重复就地 `merge`、发现记录就地 `retire`，会把判断藏进动作里。先写建议，再让维护动作引用它——这样「为什么变」和「变了什么」是两个可以分别反驳的节点。
+
+珊瑚留住的是**知识的演化史**（`supersedes` / `merges` 边，谁在什么基础上改了什么），不是**操作日志**（§20.6 的行政节点）。两者的区别就是这一节和上一节：前者进图，后者进 `note`。
 

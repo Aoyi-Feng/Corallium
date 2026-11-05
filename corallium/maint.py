@@ -9,12 +9,21 @@ from .errors import ApiError
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Queue
+
+# §20.6: records are not propositions. A node whose predicate is a version, a
+# `*_landed` marker, a curation or a merge record says that something happened;
+# it cannot be re-checked, nobody builds on it, and every one of them takes a
+# row from the fixed candidate window in `find`. Matched by name, restricted
+# further by "no children" at scan time — the shape is cheap to test, the
+# judgement stays with the curator who must still cast a vote.
+ADMIN_P = re.compile(r"^(v\d+(\.\d+)*$|.*_(landed|shipped)$|curation[:_]|merge[:_])", re.I)
 
 # A tombstone occupies the same slot the node occupied: same id, same seq, same
 # ts. Everything that was content is gone. `status: withdrawn` is not decoration:
@@ -111,8 +120,31 @@ class Maint:
         for n in alln:
             st = table[n["id"]]["derived_status"]
             by_status[st] = by_status.get(st, 0) + 1
+        # §20.6: a record of an action, not a proposition. Listed only when
+        # nobody has built on it — a bookkeeping node that acquired a child has
+        # become part of the argument and is no longer overhead.
+        admin = [{"id": n["id"], "p": n.get("p", ""), "author": n.get("author"),
+                  "why": "record-shaped predicate, no children"}
+                 for n in alln
+                 if n.get("type") in ("claim", "anomaly", "decision", "task")
+                 and table[n["id"]]["derived_status"] != "withdrawn"
+                 and n["id"] not in settled
+                 and children.get(n["id"], 0) == 0
+                 and ADMIN_P.match((n.get("p") or "").strip())]
+        # §20.7: proposals filed by agents while working. They are not work
+        # items until a curator accepts one; listing them with their age is
+        # what keeps "someone should look at this" from dying in a node.
+        max_seq = max((n.get("seq", 0) for n in alln), default=0)
+        sugg = [{"id": n["id"], "action": n.get("action"), "targets": n.get("targets") or [],
+                 "o": (n.get("o") or "")[:80], "author": n.get("author"),
+                 "seq": n.get("seq"), "age_seq": max_seq - n.get("seq", 0)}
+                for n in alln
+                if n.get("type") == "suggestion"
+                and table[n["id"]]["derived_status"] != "withdrawn"
+                and children.get(n["id"], 0) == 0]
         return {"duplicates": dups[:50], "orphans": [n["id"] for n in roots][:100],
-                "broken_refs": broken, "junk": junk[:50],
+                "broken_refs": broken, "junk": junk[:50], "admin": admin[:50],
+                "suggestions": sugg[:50],
                 "counts": {"nodes": len(alln), "roots": len(roots),
                            "roots_linked": len(roots_linked),
                            "links": sum(1 for n in alln if n.get("type") == "link"),
@@ -120,10 +152,18 @@ class Maint:
                            # is the derived count (explicit retractions included)
                            "withdrawn": by_status.get("withdrawn", 0),
                            "by_status": by_status,
+                           "admin": len(admin),
+                           # the share that says whether growth is buying
+                           # knowledge or bookkeeping (§20.6 budget: 0.05)
+                           "admin_ratio": round(len(admin) / max(len(alln), 1), 3),
+                           "suggestions": len(sugg),
+                           "suggestions_stale": sum(1 for s in sugg if s["age_seq"] > 20),
                            "duplicate_pairs": len(dups), "junk": len(junk)}}
 
 
-    def merge(self, keep: str, drop: str, reason: str, author: str) -> dict:
+
+    def merge(self, keep: str, drop: str, reason: str, author: str,
+              suggestion: str = "") -> dict:
         """L2: one node that stands for both. Nothing is destroyed — the merge
         node's `parents` are exactly what makes tip stop showing either."""
         alln = {n["id"]: n for n in self._all()}
@@ -137,7 +177,8 @@ class Maint:
         a, b = alln[keep], alln[drop]
         r = self.add_node({"s": a.get("s", ""), "p": a.get("p", ""), "o": a.get("o", ""),
                            "author": author, "type": "decision", "rel": "merges",
-                           "parents": [keep, drop], "topics": a.get("topics") or [],
+                           "parents": ([keep, drop] + ([suggestion] if suggestion else [])),
+                           "topics": a.get("topics") or [],
                            "significance": max(int(a.get("significance", 3)),
                                                int(b.get("significance", 3))),
                            "note": reason, "force": True,
@@ -146,7 +187,8 @@ class Maint:
                 "created": r["created"]}
 
 
-    def retire(self, node_id: str, reason: str, author: str) -> dict:
+    def retire(self, node_id: str, reason: str, author: str,
+               suggestion: str = "") -> dict:
         """L3: destroy content. Four machine-checkable conditions, because the
         cost of being wrong is asymmetric: leftover junk is noise, deleting a
         node someone builds on is an irreversible loss."""
@@ -166,9 +208,12 @@ class Maint:
             fails.append(f"has {len(children)} child node(s): {children[:3]}")
         if votes:
             fails.append(f"has {len(votes)} vote(s): {votes[:3]}")
-        if int(n.get("significance", 3)) > 2:
+        if int(n.get("significance", 3)) > 2 and reason.strip().lower() != "admin":
             fails.append(f"significance is {n.get('significance')} (retire allows <=2)")
-        if n.get("refs"):
+        # §20.6: an administrative node's refs point at the change it records,
+        # not at evidence for a proposition — so for `reason=admin` the
+        # evidence-backed defence does not apply. The other three gates do.
+        if n.get("refs") and reason.strip().lower() != "admin":
             fails.append("has file references: it is evidence-backed, not junk")
         junk_votes = [x["id"] for x in alln if x.get("type") == "review"
                       and x.get("claim") == node_id
@@ -181,6 +226,21 @@ class Maint:
             fails.append("no `junk` vote: nothing has accused this node of being a mistake")
         if fails:
             raise ApiError(409, "refusing to retire: " + "; ".join(fails))
+        # Applying a proposal closes it: the record's parents are the applied
+        # suggestion, so it leaves `tip` and stops appearing in `scan.suggestions`
+        # without a status field to flip.
+        if suggestion:
+            if suggestion not in by:
+                raise ApiError(404, f"unknown suggestion {suggestion}")
+            sug = by[suggestion]
+            if sug.get("type") != "suggestion":
+                raise ApiError(400, f"{suggestion} is a {sug.get('type')}, not a suggestion")
+            once = self.add_node({"s": sug.get("s", ""), "p": "applied:" + str(sug.get("action")),
+                                  "o": f"applied {sug.get('action')} to {node_id}",
+                                  "author": author, "type": "decision", "rel": "extends",
+                                  "parents": [suggestion], "force": True,
+                                  "why_new": "closure of suggestion " + suggestion})
+            del once
         return self.purge(node_id, reason, author)
 
 

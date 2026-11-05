@@ -535,6 +535,61 @@ def main():
               f"-> {'PASS' if ok else 'FAIL'}")
         if not ok:
             fails.append(26)
+        # 27 — §20.6: a record-shaped predicate with no children is listed as
+        #      administrative, is not retirable without an accusation, and is
+        #      retirable with reason=admin even though it carries a ref.
+        adm = req(a.port, "/nodes", {"s": "ADMIN", "p": "impl:v9.9.9_landed",
+                                     "o": "v9.9.9 落地", "author": "a", "topics": ["M"],
+                                     "significance": 4,
+                                     "refs": [{"path": os.path.abspath(__file__)}]})[1]["node"]
+        par = req(a.port, "/nodes", {"s": "ADMIN", "p": "impl:v9.9.8_shipped",
+                                     "o": "v9.9.8 落地", "author": "a", "topics": ["M"],
+                                     "significance": 1})[1]["node"]
+        req(a.port, "/nodes", {"s": "ADMIN", "p": "child:of_record", "o": "有人接着往下问",
+                               "author": "a", "topics": ["M"], "parents": [par["id"]]})
+        sc4 = req(a.port, "/maintenance/scan")[1]
+        listed = {x["id"] for x in sc4.get("admin", [])}
+        code_refuse = req(a.port, "/maintenance/retire",
+                          {"id": adm["id"], "reason": "admin", "author": "cur"})[0]
+        req(a.port, f"/nodes/{adm['id']}/replies",
+            {"kind": "junk", "author": "b", "artifact": "t", "text": "record, not a claim"})
+        code_ok = req(a.port, "/maintenance/retire",
+                      {"id": adm["id"], "reason": "admin", "author": "cur"})[0]
+        ok = (adm["id"] in listed and par["id"] not in listed
+              and sc4["counts"]["admin"] >= 1 and sc4["counts"]["admin_ratio"] > 0
+              and code_refuse == 409 and code_ok in (200, 201))
+        print(f"[27] admin nodes: listed={adm['id'] in listed} "
+              f"child_protected={par['id'] not in listed} "
+              f"refuse_without_vote={code_refuse} retire_with_vote={code_ok} "
+              f"ratio={sc4['counts']['admin_ratio']} -> {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            fails.append(27)
+        # 28 — §20.7: an agent's proposal is a node, not a belief: it is listed
+        #      by scan, absent from tip, and closed by the action that applies it.
+        x = req(a.port, "/nodes", {"s": "SUG", "p": "cache_size", "o": "写缓存是 64 MB",
+                                   "author": "a", "topics": ["M"],
+                                   "force": True, "why_new": "测试用"})[1]["node"]
+        y = req(a.port, "/nodes", {"s": "SUG", "p": "cache_size", "o": "每个设备的写缓存为 64 MB",
+                                   "author": "a", "topics": ["M"],
+                                   "force": True, "why_new": "测试用：同一条事实的另一种写法"})[1]["node"]
+        sg = req(a.port, "/nodes", {"s": "SUG", "p": "suggest:merge",
+                                    "o": "这两条是同一条事实，合并不会丢信息",
+                                    "type": "suggestion", "action": "merge",
+                                    "targets": [x["id"], y["id"]], "author": "b",
+                                    "topics": ["M"], "significance": 2})[1]["node"]
+        sc5 = req(a.port, "/maintenance/scan")[1]
+        in_scan = any(s["id"] == sg["id"] for s in sc5.get("suggestions", []))
+        in_tip = sg["id"] in {t["id"] for t in req(a.port, "/tip?topic=M")[1]["tips"]}
+        req(a.port, "/maintenance/merge", {"keep": x["id"], "drop": y["id"],
+                                           "reason": "同一条事实", "author": "cur",
+                                           "suggestion": sg["id"]})
+        sc6 = req(a.port, "/maintenance/scan")[1]
+        closed = not any(s["id"] == sg["id"] for s in sc6.get("suggestions", []))
+        ok = in_scan and not in_tip and closed and sc5["counts"]["suggestions"] >= 1
+        print(f"[28] suggestion: in_scan={in_scan} in_tip={in_tip} closed_by_merge={closed} "
+              f"count={sc5['counts']['suggestions']} -> {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            fails.append(28)
         stop(srv)
     finally:
         if srv is not None:

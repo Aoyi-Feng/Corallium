@@ -176,11 +176,13 @@ def make_handler(corals: dict, read_token: str, write_token: str, default: str |
                     return self._send(201, store.merge(payload.get("keep", ""),
                                                        payload.get("drop", ""),
                                                        payload.get("reason", ""),
-                                                       payload.get("author", "curator")))
+                                                       payload.get("author", "curator"),
+                                                       payload.get("suggestion", "")))
                 if ep == "/maintenance/retire":
                     return self._send(200, store.retire(payload.get("id", ""),
                                                         payload.get("reason", ""),
-                                                        payload.get("author", "curator")))
+                                                        payload.get("author", "curator"),
+                                                        payload.get("suggestion", "")))
                 if ep == "/purge":
                     r = store.purge(payload.get("id", ""), payload.get("reason", ""),
                                     payload.get("author", "unknown"))

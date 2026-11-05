@@ -303,7 +303,9 @@ class Derive:
         # §20.2: a `link` node is a directory entry, not a belief. It has no
         # parents, so without this filter every link would itself be a leaf and
         # `tip` would answer "what do we believe now" with a list of pointers.
-        scope = [n for n in scope if n.get("type") != "link"]
+        # §20.7: a `suggestion` is a proposal about the shape, not a belief:
+        # it must not answer "what do we believe now" either.
+        scope = [n for n in scope if n.get("type") not in ("link", "suggestion")]
         ids = {n["id"] for n in scope}
         child_of = {p for n in scope for p in (n.get("parents") or []) if p in ids}
         tips = [n for n in scope if n["id"] not in child_of]
