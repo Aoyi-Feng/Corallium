@@ -1,4 +1,4 @@
-# Corallium Protocol v0.1.26
+# Corallium Protocol v0.1.27
 
 > 名字来自珊瑚：新珊瑚虫长在旧骨骼上，一层层叠，分支形态本身就是历史。
 
@@ -1308,6 +1308,7 @@ grep -c '<明文>' <root>/index.db*      # 必须全是 0
 
 ## 变更记录
 
+- **v0.1.27** — 建议节点真的被存下来了：`add_node` 之前对 `type=suggestion` 的 `action`/`targets` 直接丢弃（插件一直在发，服务端一直扔，`scan` 里每条建议都是 `action: null`）。现在写入时校验并落盘：`action` 必须是 merge/retire/link/split/reindex 之一，`targets` 必须非空且都存在，否则 400——与 `parents` 同一条理由：打错字必须当场失败，而不是永久落盘。
 - **v0.1.26** — §20.9 引用是指针，不是命题：`refs` 在仓库内的路径改为相对存储（仓库根写在 `coral.yaml` 的 `repo:`，家目录内的写 `~/…`），验证时按同一规则解析；新增 `POST /maintenance/repin {from,to}` 原地改写一批节点的 refs（同 id、同 seq、重算 sha256），并发一条 decision 作为唯一记录；`rel=supersedes` 在 `s/p/o` 与父节点完全相同时返回 409。这是 118→276→315 那条三胞胎链的成因：文件名一改，唯一合法的修法是重发同一条命题。现在改路径只用一次维护动作，改完不会多一个节点。`retire` 新增 `reason=duplicate`：命题在别处存在时，即使 significance 高也允许删除（唯一副本仍然拒绝）。
 - **v0.1.25** — §20.8 维护不能消灭知识：`retire` 增加一道机器可查的检查——只有当命题在别处仍然存在（相似度 ≥0.90 的另一条活节点）或属于 §20.6 的行政节点（`reason=admin`）时才允许；否则返回 409 并指出「这是唯一副本」，正确动词是 `merge` 或 `supersedes`。这让「不丢知识」从承诺变成检查：今天 3 条 junk 候选里没有一条有近邻，它们现在都删不掉——这不是退化，是这条规则本来要拦的东西。
 - **v0.1.24** — §20.7 维护建议：`type=suggestion`（`action` ∈ merge/retire/link/split/reindex，`targets` 列出对象）成为 agent 在写作过程中提交形状意见的正式通道——不进 `tip`、不过闸门、不参与派生；`scan` 新增 `suggestions` 桶（带 `age_seq`）与 `counts.suggestions_stale`；`merge`/`retire` 接受 `suggestion=<id>` 并在记录里关闭它。理由：维护判断如果只活在 chat 里，下一次会话就不存在；如果直接就地执行，判断就藏进了动作。建议节点把「为什么变」和「变了什么」拆成两个可分别反驳的对象。

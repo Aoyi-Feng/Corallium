@@ -206,6 +206,24 @@ class Write:
             for k in ("claim", "prior", "kind", "artifact"):
                 if payload.get(k):
                     node[k] = payload[k]
+            # §20.7: a suggestion without its action and targets is an opinion.
+            # These were dropped here until v0.1.26 — the plugin sent them, the
+            # store discarded them, and scan listed every proposal as `action:
+            # null`. Unknown actions are refused for the same reason `parents`
+            # are: a typo must fail while the writer still sees the candidate.
+            if ntype == "suggestion":
+                act = (payload.get("action") or "").strip()
+                if act not in ("merge", "retire", "link", "split", "reindex"):
+                    raise ApiError(400, "suggestion needs action one of "
+                                        "merge|retire|link|split|reindex (got %r)" % act)
+                tg = payload.get("targets") or []
+                if not isinstance(tg, list) or not tg:
+                    raise ApiError(400, "suggestion needs targets: the node ids it would touch")
+                bad = [x for x in tg if not c.execute("SELECT 1 FROM nodes WHERE id=?", (x,)).fetchone()]
+                if bad:
+                    raise ApiError(400, "unknown target id(s): " + ", ".join(bad[:3]))
+                node["action"] = act
+                node["targets"] = tg
             if payload.get("force"):
                 node["forced"] = True
                 node["why_new"] = payload.get("why_new", "")

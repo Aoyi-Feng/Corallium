@@ -586,7 +586,17 @@ def main():
                                            "suggestion": sg["id"]})
         sc6 = req(a.port, "/maintenance/scan")[1]
         closed = not any(s["id"] == sg["id"] for s in sc6.get("suggestions", []))
-        ok = in_scan and not in_tip and closed and sc5["counts"]["suggestions"] >= 1
+        # v0.1.27: the server used to drop `action`/`targets` on the floor, so
+        # every suggestion arrived as action=null; a typo used to land forever.
+        bad_act = req(a.port, "/nodes", {"s": "SUG", "p": "suggest:x", "o": "no action",
+                                         "type": "suggestion", "author": "b", "topics": ["M"]})[0]
+        bad_tgt = req(a.port, "/nodes", {"s": "SUG", "p": "suggest:merge", "o": "bad target",
+                                         "type": "suggestion", "action": "merge",
+                                         "targets": ["deadbeef0000"], "author": "b",
+                                         "topics": ["M"]})[0]
+        ok = (in_scan and not in_tip and closed and sc5["counts"]["suggestions"] >= 1
+              and sg.get("action") == "merge" and sg.get("targets") == [x["id"], y["id"]]
+              and bad_act == 400 and bad_tgt == 400)
         print(f"[28] suggestion: in_scan={in_scan} in_tip={in_tip} closed_by_merge={closed} "
               f"count={sc5['counts']['suggestions']} -> {'PASS' if ok else 'FAIL'}")
         if not ok:
