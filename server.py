@@ -252,36 +252,52 @@ class Store:
         c = self._conn()
         q = (q or "").strip()
         out: list[dict] = []
+        outside = 0
+        scoped = False
         if len(q) >= 3:  # trigram needs 3+ chars
             try:
-                # Order by FTS relevance (bm25), NOT by seq: ordering by seq forces
-                # a JOIN over every match (246 ms at 500k rows) while rank is free.
-                # No ORDER BY rank: bm25 scoring costs 36-49 ms per query because
-                # it scores every match. Plain LIMIT is 0.0-0.3 ms; we sort the
-                # handful of rows in Python instead.
-                ids = [r[0] for r in c.execute(
-                    "SELECT nid FROM nodes_fts WHERE nodes_fts MATCH ? LIMIT ?",
-                    ('"' + q.replace('"', '""') + '"', max(limit * 4, 20)),
-                ).fetchall()]
-                ids = list(dict.fromkeys(ids))  # FTS rows are per-insert, not per-id
-                if ids:
-                    marks = ",".join("?" * len(ids))
-                    got = {}
-                    for rid, b in c.execute(
-                            f"SELECT id, body FROM nodes WHERE id IN ({marks})", ids):
-                        n = json.loads(b)
-                        n.setdefault("id", rid)  # body may predate the id field
-                        got[rid] = n
-                    out = [got[i] for i in ids if i in got]
-                    # claims before review nodes: a vote mentioning "571" must
-                    # not displace the conclusion itself in a 5-row answer.
-                    out.sort(key=lambda n: (n.get("type") == "review", -n.get("seq", 0)))
+                phrase = '"' + q.replace('"', '""') + '"'
+                if root:
+                    # Scope before slicing. Filtering the twenty newest matches by
+                    # topic made `find q --root X` answer "no hits" while a hundred
+                    # in-scope nodes sat further back, and made `outside` a count of
+                    # the sample rather than of the matches (§11.5 says report it).
+                    rows = c.execute(
+                        "SELECT n.id, n.body, n.topics FROM nodes n WHERE n.id IN "
+                        "(SELECT nid FROM nodes_fts WHERE nodes_fts MATCH ?) "
+                        "ORDER BY n.seq DESC LIMIT 5000", (phrase,)).fetchall()
+                    for rid, b, topics in rows:
+                        if root in json.loads(topics or "[]"):
+                            if len(out) < max(limit * 8, 40):
+                                n = json.loads(b)
+                                n.setdefault("id", rid)
+                                out.append(n)
+                        else:
+                            outside += 1
+                    scoped = True
+                else:
+                    # No ORDER BY rank: bm25 scoring costs 36-49 ms per query
+                    # because it scores every match; we sort the handful in Python.
+                    ids = [r[0] for r in c.execute(
+                        "SELECT nid FROM nodes_fts WHERE nodes_fts MATCH ? LIMIT ?",
+                        (phrase, max(limit * 4, 20)),
+                    ).fetchall()]
+                    ids = list(dict.fromkeys(ids))  # FTS rows are per-insert, not per-id
+                    if ids:
+                        marks = ",".join("?" * len(ids))
+                        got = {}
+                        for rid, b in c.execute(
+                                f"SELECT id, body FROM nodes WHERE id IN ({marks})", ids):
+                            n = json.loads(b)
+                            n.setdefault("id", rid)  # body may predate the id field
+                            got[rid] = n
+                        out = [got[i] for i in ids if i in got]
             except sqlite3.OperationalError:
                 out = []
         # LIKE is a full scan (161-181 ms at 500k). Only use it when FTS cannot
         # answer: no trigram support, or a query shorter than 3 chars. Falling
         # back on "no hits" would make every miss the slowest possible query.
-        if not out and (not getattr(self, "fts_ok", False) or len(q) < 3):
+        if not out and not scoped and (not getattr(self, "fts_ok", False) or len(q) < 3):
             like = f"%{q.lower()}%"
             cur = c.execute(
                 """SELECT body FROM nodes
@@ -294,11 +310,13 @@ class Store:
         c.close()
 
         out = self.annotate(out)
-        outside = 0
-        if root:
+        if root and not scoped:
             keep = [n for n in out if root in (n.get("topics") or [])]
             outside = len(out) - len(keep)
             out = keep
+        # claims before review nodes: a vote mentioning "571" must not displace
+        # the conclusion itself in a five-row answer.
+        out.sort(key=lambda n: (n.get("type") == "review", -n.get("seq", 0)))
         if order == "significance":
             out.sort(key=lambda n: (n.get("significance", 3), n.get("score", 0)), reverse=True)
         elif order == "score":
@@ -328,7 +346,7 @@ class Store:
 
     def derive_status(self, node: dict, all_nodes: list[dict],
                       by_id: dict | None = None, dead: set | None = None,
-                      replaced: set | None = None) -> str:
+                      replaced: set | None = None, merged: set | None = None) -> str:
         """Status is computed, never written back.
 
         Precedence matters: withdrawn > suspect > contested > confirmed > open.
@@ -337,6 +355,8 @@ class Store:
         """
         if dead is None or replaced is None:
             dead, replaced = self._dead_sets(all_nodes)
+        if merged is None:
+            merged = self._merged_pairs(all_nodes)
         by_id = by_id or {n["id"]: n for n in all_nodes}
         if node["id"] in dead or node.get("status") == "withdrawn":
             return "withdrawn"
@@ -348,6 +368,8 @@ class Store:
         for r in node.get("refs") or []:
             if r.get("path") and not Path(r["path"]).is_file():
                 return "suspect"
+            if r.get("node") and not r.get("coral") and r["node"] not in by_id:
+                return "suspect"  # a node ref to an id that is not here cannot be opened
         if any(r.get("missing") for r in (node.get("refs") or [])):
             return "suspect"  # the evidence file is gone; the claim is uncheckable
 
@@ -375,14 +397,23 @@ class Store:
         rivals = [n for n in all_nodes
                   if n.get("type") == "claim" and n.get("s") == node.get("s")
                   and n.get("p") == node.get("p") and n.get("o") != node.get("o")
-                  and n["id"] not in dead and n["id"] not in replaced]
+                  and n["id"] not in dead and n["id"] not in replaced
+                  # §6.2: a `merges` decision adjudicated exactly this pair.
+                  # Counting it as a live rival afterwards left both branches
+                  # `contested` forever — the graph recorded a resolution that
+                  # the derived status never noticed.
+                  and frozenset((node["id"], n["id"])) not in merged]
         if rivals:
             return "contested"  # two live answers to the same question
 
         strong = [v for v in votes
                   if (v.get("kind") or v.get("p")) == "adversarial"
                   or ((v.get("kind") or v.get("p")) == "replicated" and v.get("prior"))]
-        if strong:
+        # §4.4: two independent `sourced` votes are corroboration of the same
+        # strength as one replication — two sources that never saw each other
+        # are independent in the sense the protocol cares about.
+        sourced = [v for v in votes if (v.get("kind") or v.get("p")) == "sourced"]
+        if strong or len(sourced) >= 2:
             # multiple-comparisons gate: tried 6+ configurations without anyone
             # trying to kill it? Then it is the winner of a search, not a fact.
             attempts = int(node.get("attempts", 1) or 1)
@@ -390,6 +421,23 @@ class Store:
                 return "open"
             return "confirmed"
         return "open"
+
+    @staticmethod
+    def _merged_pairs(all_nodes: list[dict]) -> set:
+        """Pairs of nodes a `merges` decision has adjudicated (§6.2).
+
+        All pairs, not just the first two: a decision may name several branches
+        at once, and every pair it names has been settled by it.
+        """
+        out = set()
+        for n in all_nodes:
+            if n.get("rel") != "merges":
+                continue
+            ps = n.get("parents") or []
+            for i in range(len(ps)):
+                for j in range(i + 1, len(ps)):
+                    out.add(frozenset((ps[i], ps[j])))
+        return out
 
     @staticmethod
     def _gate(v: dict, target_author: str | None):
@@ -471,6 +519,24 @@ class Store:
         out.sort(key=lambda n: (-n.get("significance", 3), n.get("seq", 0)))
         return out
 
+    def claims(self, live_only: bool = True) -> list[dict]:
+        """Leases are the one piece of state that is not derived, and until now
+        they were write-only: an agent could take one, and nobody — not even the
+        holder — could ask what was currently claimed. That makes §7 useless in
+        exactly the situation it exists for (two agents, same question).
+        """
+        c = self._conn()
+        rows = c.execute(
+            "SELECT task_key, question, author, lease_until, status, ts FROM claims "
+            "ORDER BY lease_until DESC").fetchall()
+        c.close()
+        now = time.time()
+        out = [dict(zip(("task_key", "question", "author", "lease_until", "status", "ts"), r))
+               for r in rows]
+        if live_only:
+            out = [r for r in out if (r.get("lease_until") or 0) > now]
+        return out
+
     def reviews(self, target_id: str) -> dict:
         """The vote list for any node — claim or another vote — as a timeline."""
         c = self._conn()
@@ -507,6 +573,7 @@ class Store:
         scores = self._scores(alln)
         by_id = {n["id"]: n for n in alln}
         dead, replaced = self._dead_sets(alln)
+        merged = self._merged_pairs(alln)
         deps: dict[str, int] = {}
         for n in alln:
             for p_ in (n.get("parents") or []):
@@ -514,17 +581,36 @@ class Store:
         red_targets = {v.get("claim") for v in alln
                        if v.get("type") == "review"
                        and (v.get("kind") or v.get("p")) == "redundant"}
+        # §4.4: `confirmed` has two levels and `tip` must show which one.
+        # "Nobody objected" is not "survived attack"; computing the set once is
+        # what keeps this from being another full scan per node.
+        challenged = {v.get("claim") for v in alln
+                      if v.get("type") == "review"
+                      and (v.get("kind") or v.get("p")) == "adversarial"
+                      and v.get("author") != (by_id.get(v.get("claim")) or {}).get("author")}
         table: dict[str, dict] = {}
         for n in alln:
             m = dict(n)
-            m["derived_status"] = self.derive_status(n, alln, by_id, dead, replaced)
+            m["derived_status"] = self.derive_status(n, alln, by_id, dead, replaced, merged)
+            if m["derived_status"] == "confirmed":
+                m["confirmed_level"] = "challenged" if n["id"] in challenged else "unchallenged"
             if n["id"] in red_targets:
                 m["merge_candidate"] = True
             rs = n.get("refs") or []
             if rs:
-                m["refs"] = len(rs)
-                m["refs_missing"] = sum(1 for r in rs if not Path(r.get("path", "")).is_file())
-            if n.get("type") == "claim":
+                # Do not overwrite `refs` with a number: a caller that reads the
+                # hit then tries to open the evidence gets `2` instead of a list,
+                # and a ref with `node` instead of `path` (Path("") == ".") used
+                # to be counted as a missing file.
+                m["refs_count"] = len(rs)
+                m["refs_missing"] = sum(1 for r in rs
+                                        if r.get("path") and not Path(r["path"]).is_file())
+            if n.get("type") not in ("review", "tombstone"):
+                # Every proposition can be voted on (§4.2), not only `claim`.
+                # A `question` or `anomaly` that carries a real `sourced` vote
+                # used to render score=None and votes=None, so the vote existed
+                # in the graph and was invisible in every read — the same silent
+                # loss as a vote aimed at a typo'd id.
                 sc = scores.get(n["id"], {"score": 0, "votes": 0})
                 m["score"] = sc["score"]
                 m["votes"] = sc["votes"]
@@ -552,9 +638,15 @@ class Store:
         c.close()
         if topic:
             low = topic.lower()
+            # Topic labels are the aggregation axis (§2.3). Matching the label
+            # anywhere in the JSON meant `tip protocol` pulled in every node whose
+            # note merely mentioned the word, so the "current beliefs" list was
+            # mostly history. Free text is a fallback for a label that is not in
+            # use, not the primary interpretation.
             scope = [n for n in alln
-                     if low in (n.get("topics") or [])
-                     or low in json.dumps(n, ensure_ascii=False).lower()]
+                     if low in [str(t).lower() for t in (n.get("topics") or [])]]
+            if not scope:
+                scope = [n for n in alln if low in json.dumps(n, ensure_ascii=False).lower()]
         else:
             scope = alln
         if not scope:
@@ -610,13 +702,20 @@ class Store:
         c = self._conn()
         rows = (c.execute("SELECT body FROM nodes WHERE id=?", (node_id,)).fetchall()
                 if node_id else c.execute("SELECT body FROM nodes").fetchall())
+        ids = {r[0] for r in c.execute("SELECT id FROM nodes").fetchall()}
         c.close()
         out = []
         for (b,) in rows:
             n = json.loads(b)
             for i, r in enumerate(n.get("refs") or []):
                 if r.get("node"):
-                    out.append({"node": n["id"], "i": i, "ref": r, "state": "node"})
+                    # A node reference is a pointer too. It used to answer
+                    # "node" — counted as ok — without ever looking the target
+                    # up, so a ref to a mistyped id was evidence that could not
+                    # be opened, reported as present. Cross-coral refs carry
+                    # `coral` and are not in this index at all.
+                    state = "node" if r.get("coral") or r["node"] in ids else "missing"
+                    out.append({"node": n["id"], "i": i, "ref": r, "state": state})
                     continue
                 f = Path(r["path"])
                 if not f.is_file():
@@ -646,19 +745,32 @@ class Store:
         make publishing O(coral), and publishing is the thing we want to be easy.
         """
         c = self._conn()
-        terms = [w for w in re.findall(r"[A-Za-z0-9_]{3,}", f"{p} {o}")][:6]
+        terms = list(dict.fromkeys(re.findall(r"[A-Za-z0-9_]{3,}", f"{p} {o}")))
+        match = " OR ".join('"' + t + '"' for t in terms[:6])
+        if not terms:
+            # CJK text has no 3-char ASCII token, but it does have trigrams. The
+            # old fallback compared every Chinese write against the *first* N rows
+            # in the store — an arbitrary sample — so the gate that §3.4 relies on
+            # was silently useless on a Chinese coral. Query the same index with
+            # evenly spaced 3-char windows of the proposition instead.
+            text = re.sub(r"\s+", "", f"{p} {o}")
+            windows = list(dict.fromkeys(text[i:i + 3] for i in range(max(0, len(text) - 2))))
+            if len(windows) > 8:
+                step = len(windows) / 8
+                windows = [windows[int(i * step)] for i in range(8)]
+            match = " OR ".join('"' + w + '"' for w in windows if w.strip())
         rows = []
-        if terms:
-            q = " OR ".join('"' + t + '"' for t in terms)
+        if match:
             try:
                 rows = c.execute(
                     "SELECT nid FROM nodes_fts WHERE nodes_fts MATCH ? LIMIT ?",
-                    (q, limit)).fetchall()
+                    (match, max(limit * 4, 20))).fetchall()
             except sqlite3.OperationalError:
                 rows = []
         ids = list(dict.fromkeys(r[0] for r in rows))
-        if not ids:  # CJK text has no [A-Za-z0-9_]{3,} tokens; fall back to a scan
-            ids = [r[0] for r in c.execute("SELECT id FROM nodes LIMIT ?", (limit * 8,))]
+        if not ids:  # nothing shares a window: compare against the newest writes
+            ids = [r[0] for r in c.execute(
+                "SELECT id FROM nodes ORDER BY seq DESC LIMIT ?", (max(limit * 4, 20),))]
         marks = ",".join("?" * len(ids))
         got = [json.loads(b) for (b,) in c.execute(
             f"SELECT body FROM nodes WHERE id IN ({marks})", ids).fetchall()] if ids else []
@@ -693,12 +805,34 @@ class Store:
                 raise ValueError("s, p, o are required")
             rel = payload.get("rel", "root")
             parents = payload.get("parents") or []
+            ntype = payload.get("type", "claim")
+            # A parent id that resolves to nothing is not a weaker edge, it is no
+            # edge at all: the child silently becomes a root, never cascades when
+            # its support is retracted, and — because the write gate is skipped
+            # whenever `parents` is non-empty — it also buys a free pass around
+            # §3.4. A typo must fail loudly here, while the writer still has the
+            # candidate list in front of them.
+            if parents:
+                missing = [p for p in parents
+                           if not c.execute("SELECT 1 FROM nodes WHERE id=?", (p,)).fetchone()]
+                if missing:
+                    raise ApiError(400, "unknown parent id(s): " + ", ".join(missing[:3]) +
+                                        " — get the id from /find; a node must grow on a node "
+                                        "that exists (PROTOCOL §3.4.2)")
             # A vote's identity includes who cast it and what it rests on.
             # Without author+artifact in the hash, two agents who write the same
             # words collapse into one vote and the second disappears silently —
             # observed live when two of four parallel agents cast the same
             # `redundant` verdict.
             if payload.get("type") == "review":
+                target = payload.get("claim")
+                # A vote id typo'd by one character used to land anyway: it is a
+                # valid node, it appears in `since`, and it counts toward nothing
+                # forever. Nodes are immutable, so there is no way to re-attach it.
+                if not target or not c.execute("SELECT 1 FROM nodes WHERE id=?",
+                                               (target,)).fetchone():
+                    raise ApiError(404, f"no such node: {target} — a vote must point at "
+                                        "a node that exists (PROTOCOL §4.1.2)")
                 blob = json.dumps([s, p, o, rel, sorted(parents),
                                    payload.get("author", ""), payload.get("prior", ""),
                                    payload.get("artifact", "")], ensure_ascii=False)
@@ -713,7 +847,6 @@ class Store:
             # §3.4.1 — the gate that stops the graph from spreading sideways.
             # It only runs for propositions: a review points at its claim by
             # construction, and a task is an obligation, not a finding.
-            ntype = payload.get("type", "claim")
             gateable = ntype in ("claim", "anomaly", "question", "decision")
             if gateable and not parents:
                 cand = self._candidates(p, o)
@@ -772,28 +905,49 @@ class Store:
                  node["status"], json.dumps(node["topics"]), json.dumps(node, ensure_ascii=False)),
             )
             self._fts_put(c, node)
-            return {"created": True, "node": node}
+            out = {"created": True, "node": node}
+            if gateable and parents:
+                # §3.4.1 promises `linked_to` on the parents exit: the writer gets
+                # to see which existing nodes this one now sits next to, so the
+                # next agent's search starts from the right branch. It was in the
+                # table and not in the response.
+                out["linked_to"] = [x["id"] for x in self._candidates(p, o)
+                                    if x["similarity"] >= 0.62]
+            return out
 
         return self._run(job)
 
     def claim(self, question: str, author: str, ttl_min: int) -> dict:
         def job(c):
             now = time.time()
+            if not (question or "").strip():
+                # An empty question hashes to one key, so every agent that ever
+                # omits it contends for the same nameless lease.
+                raise ValueError("question is required: a lease with no question "
+                                 "locks a name nobody can describe")
             key = hashlib.sha256(question.strip().lower().encode()).hexdigest()[:12]
             row = c.execute(
                 "SELECT author, lease_until FROM claims WHERE task_key=?", (key,)
             ).fetchone()
-            if row and row[1] and row[1] > now and row[0] != author:
-                return {"acquired": False, "holder": row[0], "lease_until": row[1]}
             if ttl_min <= 0:
                 # ttl<=0 is a release, not a claim: the CLI had no other way to
                 # hand a question back, and `ttl=0` used to mean "expires now",
                 # which let 8 of 20 contenders all win at once.
+                # It is checked before the "busy" answer so that a refused
+                # release says `released: false` + holder instead of looking
+                # like a claim that merely lost the race.
                 if not row:
                     return {"released": False, "reason": "no such question"}
+                if row[1] and row[1] > now and row[0] != author:
+                    # Holder-only: otherwise any agent can drop someone else's
+                    # lease mid-run and silently start the same research twice.
+                    return {"released": False, "holder": row[0],
+                            "reason": "held by someone else"}
                 c.execute("DELETE FROM claims WHERE task_key=?", (key,))
                 self._save_claims(c)
-                return {"released": True, "task_key": key}
+                return {"released": True, "task_key": key, "question": question}
+            if row and row[1] and row[1] > now and row[0] != author:
+                return {"acquired": False, "holder": row[0], "lease_until": row[1]}
             c.execute(
                 "INSERT INTO claims VALUES (?,?,?,?,?,?) ON CONFLICT(task_key) DO UPDATE SET "
                 "author=excluded.author, lease_until=excluded.lease_until, status='claimed'",
@@ -1044,6 +1198,22 @@ def make_handler(corals: dict, read_token: str, write_token: str, default: str |
         def log_message(self, *a):  # quiet
             pass
 
+        def _path(self) -> str:
+            """The request target, decoded as UTF-8 when it is not ASCII.
+
+            http.server decodes the request line as latin-1, so `?q=写缓存`
+            (what `curl` sends when the query is pasted raw) arrives as mojibake
+            and matches nothing — a silent zero-hit answer for a library whose
+            contents are mostly Chinese. Percent-encoded clients are unaffected.
+            """
+            p = self.path
+            if not p.isascii():
+                try:
+                    p = p.encode("latin-1").decode("utf-8")
+                except (UnicodeEncodeError, UnicodeDecodeError):
+                    pass
+            return p
+
         def _send(self, code: int, obj) -> None:
             body = json.dumps(obj, ensure_ascii=False).encode()
             self.send_response(code)
@@ -1055,7 +1225,14 @@ def make_handler(corals: dict, read_token: str, write_token: str, default: str |
         def _auth(self, write: bool) -> bool:
             got = (self.headers.get("Authorization") or "").replace("Bearer ", "").strip()
             want = write_token if write else read_token
-            if not want:  # no token configured → local trust
+            if write and not write_token and read_token:
+                # A deployment that set only a read token is declaring "read only".
+                # Treating the missing write token as "no auth needed" turned that
+                # declaration into the opposite: the one credential handed out was
+                # a read token, and every write was open to anyone.
+                self._send(401, {"error": "read-only deployment: no write token is configured"})
+                return False
+            if not want:  # nothing configured → local trust
                 return True
             if got != want:
                 self._send(401, {"error": "unauthorized"})
@@ -1081,17 +1258,22 @@ def make_handler(corals: dict, read_token: str, write_token: str, default: str |
             return corals[default], path, default
 
         def do_GET(self):
-            u = urlparse(self.path)
+            u = urlparse(self._path())
             q = parse_qs(u.query)
             # /health stays unauthenticated: systemd and monitors probe it, and
             # it leaks nothing but coral names and sequence numbers.
             if u.path == "/health":
-                meta = {n: {"path": str(s.root), "max_seq": s.max_seq(),
+                # Unauthenticated on purpose (systemd and monitors probe it), so it
+                # may say which corals exist and how far they are — never where
+                # they live on disk. The path is served by the authenticated
+                # /corals endpoint instead.
+                meta = {n: {"max_seq": s.max_seq(),
                             **{k: v for k, v in coral_meta(s.root).items()
                                if k in ("description", "owner", "protocol")}}
                         for n, s in corals.items()}
                 return self._send(200, {
                     "ok": True, "default": default,
+                    "protocol": server_version(),
                     "max_seq": meta[default]["max_seq"] if default else 0,
                     "corals": meta,
                 })
@@ -1106,6 +1288,7 @@ def make_handler(corals: dict, read_token: str, write_token: str, default: str |
                     return self._send(200, {
                         "ok": True,
                         "default": default,
+                        "protocol": server_version(),
                         # top-level max_seq keeps single-coral clients working
                         "max_seq": meta[default]["max_seq"] if default else 0,
                         "corals": meta,
@@ -1126,6 +1309,9 @@ def make_handler(corals: dict, read_token: str, write_token: str, default: str |
                     return self._send(200, store.verify_refs(q.get("node", [None])[0]))
                 if ep == "/maintenance/scan":
                     return self._send(200, store.scan())
+                if ep == "/claims":
+                    return self._send(200, {"claims": store.claims(
+                        live_only=(q.get("all", ["0"])[0] != "1"))})
                 if ep == "/tasks":
                     return self._send(200, {"tasks": store.tasks(
                         include_closed=(q.get("all", ["0"])[0] == "1"))})
@@ -1138,13 +1324,15 @@ def make_handler(corals: dict, read_token: str, write_token: str, default: str |
                                                order=(q.get("sort", ["recent"])[0] or "recent"))
                     return self._send(200, {"hits": hits, "outside": outside})
                 return self._send(404, {"error": "not found"})
+            except ValueError as e:  # ?cursor=abc is the caller's fault, not a crash
+                return self._send(400, {"error": str(e)})
             except Exception as e:
                 return self._send(500, {"error": f"{type(e).__name__}: {e}"})
 
         def do_POST(self):
             if not self._auth(write=True):
                 return
-            u = urlparse(self.path)
+            u = urlparse(self._path())
             try:
                 ln = int(self.headers.get("Content-Length") or 0)
                 payload = json.loads(self.rfile.read(ln) or b"{}")
@@ -1164,7 +1352,8 @@ def make_handler(corals: dict, read_token: str, write_token: str, default: str |
                         int(payload.get("ttl", 30))))
                 if ep.startswith("/nodes/") and ep.endswith("/replies"):
                     nid = ep[len("/nodes/"):-len("/replies")]
-                    return self._send(201, store.reply(nid, payload))
+                    r = store.reply(nid, payload)
+                    return self._send(201 if r.get("created") else 200, r)
                 if ep == "/maintenance/merge":
                     return self._send(201, store.merge(payload.get("keep", ""),
                                                        payload.get("drop", ""),
@@ -1187,6 +1376,20 @@ def make_handler(corals: dict, read_token: str, write_token: str, default: str |
                 return self._send(500, {"error": f"{type(e).__name__}: {e}"})
 
     return H
+
+
+def server_version() -> str:
+    """The protocol this process implements, from VERSION.
+
+    `/health` also carries a per-coral `protocol` taken from coral.yaml, which is
+    the version the coral was *scaffolded* under — reading that as the server's
+    version made every old coral look like an old server. Both are now explicit.
+    """
+    vf = Path(__file__).with_name("VERSION")
+    try:
+        return vf.read_text().strip()
+    except OSError:
+        return "unknown"
 
 
 def coral_meta(root: Path) -> dict:

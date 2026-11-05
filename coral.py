@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Corallium CLI — thin client for a v0.1.12 server. See PROTOCOL.md.
+"""Corallium CLI — thin client for a v0.1.17 server. See PROTOCOL.md.
 
 The server is the reference implementation; this file holds no storage model
 of its own. Everything it knows comes from HTTP, and when the server cannot be
@@ -41,7 +41,7 @@ DEFAULT_URL = "http://127.0.0.1:8731"
 CONFIG_PATH = Path(os.environ.get("CORALLIUM_CONFIG", "~/.hermes/config.yaml")).expanduser()
 
 WEIGHTS = {"adversarial": 4, "replicated": 3, "sourced": 2, "derived": 1,
-           "agree": 0, "refuted": -3}
+           "agree": 0, "refuted": -3, "redundant": -2, "junk": 0}
 RELS = ("root", "extends", "supersedes", "merges")
 TYPES = ("claim", "anomaly", "question", "decision", "task")
 READ_TIMEOUT = 3.0   # local reads are sub-ms; fail fast if the server is gone
@@ -106,10 +106,11 @@ class Offline(Exception):
 
 
 class ApiError(Exception):
-    """Server reachable but said no (400/401/404/500...)."""
+    """Server reachable but said no (400/401/404/409...)."""
 
-    def __init__(self, code: int, msg: str):
+    def __init__(self, code: int, msg: str, payload: dict | None = None):
         self.code = code
+        self.payload = payload or {}
         super().__init__(f"HTTP {code}: {msg}")
 
 
@@ -144,11 +145,13 @@ def api(url: str, ep: str, params: dict | None = None,
             return json.loads(raw or b"{}")
     except urllib.error.HTTPError as e:
         raw = e.read().decode("utf-8", "replace")
+        obj = None
         try:
-            msg = json.loads(raw).get("error") or raw
+            obj = json.loads(raw)
+            msg = obj.get("error") or obj.get("hint") or raw
         except Exception:
             msg = raw.strip() or e.reason
-        raise ApiError(e.code, msg) from None
+        raise ApiError(e.code, msg, obj if isinstance(obj, dict) else None) from None
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
         raise Offline(str(getattr(e, "reason", e))) from None
     except json.JSONDecodeError as e:
@@ -200,6 +203,13 @@ def die(msg: str, code: int = 1) -> None:
 def offline_fail(what: str, url: str, err: Exception) -> None:
     print(f"error: corallium server unreachable at {url} ({err})", file=sys.stderr)
     print(f"error: {what} NOT saved — writes never degrade (PROTOCOL §13.5)", file=sys.stderr)
+    host = urllib.parse.urlparse(url).hostname or ""
+    if host in ("127.0.0.1", "localhost", "::1"):
+        # §17.4: never start the server for the user (a client that silently
+        # starts a local one hides a misconfigured remote url), but always give
+        # the command that would fix it.
+        port = urllib.parse.urlparse(url).port or 8731
+        print(f"  -> start it: coral serve --port {port} --coral <name>", file=sys.stderr)
     raise SystemExit(1)
 
 
@@ -230,8 +240,8 @@ def _kind(n: dict) -> str:
 def _gate(v: dict) -> tuple[float, list[str]]:
     """Mirror of Store._gate (§4.2.1) so offline scores are not fantasy."""
     kind, w, caps = _kind(v), WEIGHTS.get(_kind(v), 0), []
-    if kind in ("replicated", "adversarial", "refuted"):
-        if kind != "refuted" and not v.get("prior"):
+    if kind in ("replicated", "adversarial", "refuted", "redundant"):
+        if kind not in ("refuted", "redundant") and not v.get("prior"):
             caps.append("no-prior")
         if not (v.get("artifact") or v.get("method")):
             caps.append("not-checkable")
@@ -252,15 +262,37 @@ def local_scores(alln: list[dict]) -> dict[str, float]:
     return out
 
 
-def local_status(n: dict, alln: list[dict], dead: set) -> str:
-    if n.get("status") == "withdrawn" or n["id"] in dead:
+def local_status(n: dict, alln: list[dict], dead: set, replaced: set = frozenset()) -> str:
+    """Offline mirror of Store.derive_status, precedence included: a read that
+    silently loses `suspect` is worse than no read — it reports a conclusion as
+    live after the thing it rested on was retracted."""
+    if n.get("status") == "withdrawn" or n["id"] in dead or n["id"] in replaced:
         return "withdrawn"
+    for r in n.get("refs") or []:
+        if r.get("path") and not Path(r["path"]).is_file():
+            return "suspect"
+        if r.get("missing"):
+            return "suspect"
+    by_id = {x["id"]: x for x in alln}
+    stack, seen = list(n.get("parents") or []), set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        parent = by_id.get(pid)
+        if not parent:
+            continue
+        if pid in dead:
+            return "suspect"
+        stack.extend(parent.get("parents") or [])
     votes = [v for v in alln if v.get("type") == "review" and v.get("claim") == n["id"]
              and v.get("author") != n.get("author")]
     if any(_kind(v) == "refuted" for v in votes):
         return "contested"
     if any(x.get("type") == "claim" and x.get("s") == n.get("s") and x.get("p") == n.get("p")
-           and x.get("o") != n.get("o") and x["id"] not in dead for x in alln):
+           and x.get("o") != n.get("o") and x["id"] not in dead and x["id"] not in replaced
+           for x in alln):
         return "contested"
     if any(_kind(v) == "adversarial" or (_kind(v) == "replicated" and v.get("prior"))
            for v in votes):
@@ -268,24 +300,26 @@ def local_status(n: dict, alln: list[dict], dead: set) -> str:
     return "open"
 
 
-def _dead(alln: list[dict]) -> set:
+def _sets(alln: list[dict]) -> tuple[set, set]:
+    """(dead, replaced). Both keep a node out of `tip`, but only `dead` — an
+    explicit retraction — cascades `suspect` to its descendants. Collapsing them
+    into one set marked every successor of a corrected number suspect."""
     dead = {n["id"] for n in alln if n.get("status") == "withdrawn"}
     for n in alln:
         if n.get("status") == "withdrawn" and n.get("rel") == "supersedes":
             dead.update(n.get("parents") or [])
-    for n in alln:  # superseded nodes are no longer the tip
-        if n.get("rel") == "supersedes":
-            dead.update(n.get("parents") or [])
-    return dead
+    replaced = {p for n in alln if n.get("rel") == "supersedes"
+                for p in (n.get("parents") or [])} - dead
+    return dead, replaced
 
 
 def offline_annotate(nodes: list[dict], coral: str) -> list[dict]:
     alln = local_nodes(coral)
-    scores, dead = local_scores(alln), _dead(alln)
+    scores, (dead, replaced) = local_scores(alln), _sets(alln)
     out = []
     for n in nodes:
         m = dict(n)
-        m["derived_status"] = local_status(n, alln, dead)
+        m["derived_status"] = local_status(n, alln, dead, replaced)
         m["score"] = round(scores.get(n["id"], 0.0), 2)
         m["votes"] = sum(1 for v in alln if v.get("type") == "review"
                          and v.get("claim") == n["id"] and v.get("author") != n.get("author"))
@@ -404,8 +438,9 @@ def cmd_tip(a) -> int:
                  or low in json.dumps(n, ensure_ascii=False).lower()]
         ids = {n["id"] for n in scope}
         kids = {p for n in scope for p in (n.get("parents") or []) if p in ids}
-        dead = _dead(alln)
-        tips = [n for n in scope if n["id"] not in kids and n["id"] not in dead]
+        dead, replaced = _sets(alln)
+        tips = [n for n in scope if n["id"] not in kids
+                and n["id"] not in dead and n["id"] not in replaced]
         tips = offline_annotate(tips or scope, coral)
         tips.sort(key=lambda n: n.get("seq") or 0, reverse=True)
         offline_marker(len(alln))
@@ -518,8 +553,8 @@ def cmd_tasks(a) -> int:
     except Offline as e:
         alln = local_nodes(coral)
         kids = {p for n in alln for p in (n.get("parents") or [])}
-        dead = _dead(alln)
-        tasks = [dict(n, closed=(n["id"] in kids or n["id"] in dead))
+        dead, replaced = _sets(alln)
+        tasks = [dict(n, closed=(n["id"] in kids or n["id"] in dead or n["id"] in replaced))
                  for n in alln if n.get("type") == "task"]
         tasks = [t for t in tasks if a.all or not t["closed"]]
         offline_marker(len(alln))
@@ -592,22 +627,64 @@ def cmd_since(a) -> int:
     return 0
 
 
+def cmd_serve(a) -> int:
+    """Run the reference server in this process (PROTOCOL §17.1).
+
+    A launcher, not a second storage model: coral.py still owns no node, no
+    index and no lease — it replaces itself with `server.py`, which does. The
+    protocol has promised `coral serve` in three places (§17.1, §17.4, README)
+    while the CLI had no such subcommand, so the command §17.4 tells a stuck
+    user to run answered "invalid choice: 'serve'".
+    """
+    server = Path(__file__).resolve().with_name("server.py")
+    if not server.is_file():
+        die(f"server.py not found next to coral.py ({server}) — reinstall, the CLI "
+            "cannot serve a coral without it")
+    argv = [sys.executable, str(server)]
+    if a.registry:
+        argv += ["--registry", str(Path(a.registry).expanduser())]
+    elif a.root:
+        argv += ["--root", str(Path(a.root).expanduser())]
+    elif a.coral:
+        argv += ["--root", str(corals_dir() / a.coral)]
+    else:
+        # A multi-coral install already has the index of where to look; a
+        # single-coral one falls through to server.py's own default.
+        reg = corals_dir() / "registry.yaml"
+        if reg.is_file():
+            argv += ["--registry", str(reg)]
+    argv += ["--port", str(a.port), "--bind", a.bind]
+    sys.stdout.flush()
+    os.execv(sys.executable, argv)  # never returns
+    return 1
+
+
 def cmd_claims(a) -> int:
-    """Local view only: the server has no GET /claims (leases are POST-only)."""
+    """Leases used to be write-only: `claims` read the local claims.json, which
+    is wrong the moment the server is remote. GET /claims answers for the coral
+    you are actually talking to; the file stays as the offline fallback."""
     url, coral = resolve_url(a), resolve_coral(a, resolve_url(a))
-    f = corals_dir() / coral / "claims.json"
-    rows = []
-    if f.exists():
-        try:
-            rows = json.loads(f.read_text())
-        except Exception as e:
-            die(f"cannot read {f}: {e}")
     now = datetime.now().timestamp()
+    try:
+        rows = api(endpoint(url, coral), "claims", {"all": "1" if a.all else ""}).get("claims") or []
+        src = "server"
+    except Offline:
+        f = corals_dir() / coral / "claims.json"
+        rows = []
+        if f.exists():
+            try:
+                rows = json.loads(f.read_text())
+            except Exception as e:
+                die(f"cannot read {f}: {e}")
+        rows = [r for r in rows if a.all or (r.get("lease_until") or 0) > now]
+        src = f"local {f.name} (server unreachable)"
+    except ApiError as e:
+        die(str(e))
     live = [r for r in rows if (r.get("lease_until") or 0) > now]
     for r in sorted(live, key=lambda r: -(r.get("lease_until") or 0)):
         mins = int((r["lease_until"] - now) / 60)
         print(f"{r.get('task_key')} {r.get('author','?'):<12} {mins:>3}m {clip(r.get('question'), 100)}")
-    print(f"{len(live)} live lease(s)  (local claims.json; server has no GET /claims)")
+    print(f"{len(live)} live lease(s)  ({src})")
     return 0 if live else 2
 
 
@@ -621,6 +698,10 @@ def cmd_add(a) -> int:
         die(f"--rel merges needs exactly 2 --parent (got {len(parents)})")
     if a.rel == "root" and parents:
         die("--rel root takes no --parent")
+    if a.force and not (a.why_new or "").strip():
+        # §3.4.1's third exit: force without a reason is a 400 on the server too,
+        # but failing here keeps the reason attached to the write attempt.
+        die("--force needs --why-new: say how this differs from the node it resembles")
     topics = [t.strip() for x in (a.topics or []) for t in x.split(",") if t.strip()]
     body = {
         "s": a.s, "p": a.p, "o": a.o, "rel": a.rel, "parents": parents,
@@ -628,6 +709,9 @@ def cmd_add(a) -> int:
         "attempts": a.attempts, "volatility": a.volatility,
         "note": a.note or "", "author": a.author or default_author(),
     }
+    if a.force:
+        body["force"] = True
+        body["why_new"] = a.why_new
     method = parse_method(a.method)
     if method:
         body["method"] = method
@@ -638,6 +722,14 @@ def cmd_add(a) -> int:
     except Offline as e:
         offline_fail("publish", url, e)
     except ApiError as e:
+        if e.code == 409 and e.payload.get("candidates"):
+            print("409 similar — this is already in the library:", file=sys.stderr)
+            for c in e.payload["candidates"]:
+                print(f"  {c['id']}  sim={c['similarity']:.2f}  {c.get('p')} = {c.get('o')}",
+                      file=sys.stderr)
+            print("  exits: --rel extends --parent <id>  |  --rel supersedes --parent <id>  |  "
+                  "--force --why-new \"...\"", file=sys.stderr)
+            raise SystemExit(1)
         die(f"publish rejected: {e}")
     n = r.get("node") or {}
     print(("added " if r.get("created") else "exists ") + f"{n.get('id')} seq={n.get('seq')}")
@@ -694,7 +786,9 @@ def cmd_claim(a) -> int:
 
 
 def cmd_release(a) -> int:
-    """No /release endpoint exists; re-claiming with ttl=-1 expires our own lease."""
+    """Release is POST /claims with ttl<=0 (holder-only). There is no /release
+    endpoint, and the response says `released`, not `acquired` — reading the
+    wrong key made a successful release exit 1 and report someone else's lease."""
     url, coral = resolve_url(a), resolve_coral(a, resolve_url(a))
     try:
         r = api(endpoint(url, coral), "claims", write=True,
@@ -704,10 +798,15 @@ def cmd_release(a) -> int:
         offline_fail("release", url, e)
     except ApiError as e:
         die(f"release rejected: {e}")
-    if not r.get("acquired"):
-        die(f"{r.get('holder')} holds this question — cannot release someone else's lease")
-    print(f"released {r.get('task_key')} ({a.status}): {a.question}")
-    return 0
+    if r.get("released"):
+        print(f"released {r.get('task_key')} ({a.status}): {a.question}")
+        if a.status == "abandoned":
+            print("  PROTOCOL §7.2: an abandoned question owes a dead_end node saying why "
+                  "— otherwise the next agent walks into it again", file=sys.stderr)
+        return 0
+    if r.get("holder"):
+        die(f"{r['holder']} holds this question — cannot release someone else's lease")
+    die(f"release failed: {r.get('reason') or r}")
 
 
 def default_author() -> str:
@@ -736,7 +835,7 @@ def parse_method(s: str | None) -> dict | None:
 # ── cli ───────────────────────────────────────────────────────────────────
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="coral", description="Corallium CLI — v0.1.12 thin client",
+        prog="coral", description="Corallium CLI — v0.1.17 thin client",
         epilog="exit codes: 0 ok · 1 error · 2 nothing found",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--coral", default=None, help="coral name (default: $CORALLIUM_CORAL/config)")
@@ -761,6 +860,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--topics", action="append", default=[], metavar="A,B")
     s.add_argument("--significance", type=int, default=3, choices=range(1, 6), metavar="1-5")
     s.add_argument("--note", default="")
+    s.add_argument("--force", action="store_true",
+                   help="third exit of §3.4.1: publish despite a near-duplicate; needs --why-new")
+    s.add_argument("--why-new", default="",
+                   help="how this differs from the node it resembles (required with --force)")
     s.add_argument("--method", default="", help="JSON object or k=v,k=v (config, cmd, version, seed)")
     s.add_argument("--ref", action="append", default=[], metavar="PATH",
                    help="file the server hashes at write time (repeatable)")
@@ -798,7 +901,8 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("reply", help="vote on someone else's node (§4)")
     s.add_argument("id")
     s.add_argument("--kind", default="replicated",
-                   choices=["adversarial", "replicated", "sourced", "derived", "agree", "refuted"])
+                   choices=["adversarial", "replicated", "sourced", "derived", "agree",
+                            "refuted", "redundant", "junk"])
     s.add_argument("--text", default="")
     s.add_argument("--prior", default="", help="a node you published before seeing the claim")
     s.add_argument("--artifact", default="", help="command/config that replays your check")
@@ -817,7 +921,8 @@ def build_parser() -> argparse.ArgumentParser:
     add(s)
     s.set_defaults(fn=cmd_release)
 
-    s = sub.add_parser("claims", help="live leases (local claims.json view)")
+    s = sub.add_parser("claims", help="live leases (GET /claims)")
+    s.add_argument("--all", action="store_true", help="include expired leases")
     add(s, author=False)
     s.set_defaults(fn=cmd_claims)
 
@@ -844,6 +949,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--topics", default="")
     add(s, author=False)
     s.set_defaults(fn=cmd_since)
+
+    s = sub.add_parser("serve", help="run the reference server (§17.1)")
+    s.add_argument("--port", type=int, default=8731)
+    s.add_argument("--bind", default="127.0.0.1")
+    s.add_argument("--registry", default="", help="registry.yaml listing several corals")
+    s.add_argument("--root", default="", help="one data directory (instead of --registry)")
+    add(s, author=False)   # --coral NAME serves ~/corals/NAME
+    s.set_defaults(fn=cmd_serve)
     return p
 
 

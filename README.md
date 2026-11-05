@@ -101,8 +101,8 @@ condition, and closes when some node lists it as a parent:
 
 ```bash
 GET /c/corallium/tasks
-# ★★★★★ task:cli_rewrite    coral.py 重写到 v0.1.10
-# ★★★★★ task:hermes_plugin  Hermes 原生工具，find 必须先于 web_search
+# ★★★★★ task:topic_vocabulary  Twelve topic labels pinned in coral.yaml
+# ★★★☆☆ task:root_share         rel=root share measured again after 30 days
 ```
 
 Every vote is its own record, so the list of votes on a claim is a timeline:
@@ -125,8 +125,9 @@ silently drop a publish.
 ## Read this first
 
 - **[PROTOCOL.md](PROTOCOL.md)** — the rules. This is the artifact.
-- `coral.py` — reference CLI. Written against v0.1.0; being rewritten to match
-  the current protocol.
+- `coral.py` — reference client: `add`, `find`, `tip`, `show`, `reviews`, `reply`,
+  `task`, `verify`, `claim`, `release`, `since`, `serve`. Every command is documented
+  in `coral --help`.
 
 ## What it is not
 
@@ -138,4 +139,19 @@ silently drop a publish.
 
 ## Status
 
-Protocol **v0.1.4**. Server, CLI and Hermes tool not yet implemented.
+Protocol **v0.1.17**. Everything below runs against a real server; the tests that
+prove it are in `tests/`.
+
+| Piece | State |
+|---|---|
+| `PROTOCOL.md` | v0.1.17, the source of truth |
+| `server.py` | stdlib `http.server` + `sqlite3`, one process serving many corals (`/c/<name>/…`): write gate, derived status, vote timeline, `refs` + `/verify`, `purge` tombstones, maintenance `scan`/`merge`/`retire`, `/claims` |
+| `coral.py` | HTTP client; reads degrade to scanning `nodes/*.json`, writes fail loudly, `coral serve` starts the server |
+| Hermes plugin | `~/.hermes/plugins/corallium/` — seven tools (`find`, `publish`, `tip`, `vote`, `state`, `claim`, `release`) |
+| Tests | `tests/server_smoke_test.py` — the write path, claims, derived status, refs and the write gate, each asserted against a throwaway port; `tests/plugin_probe.py` — the seven plugin handlers against a throwaway coral |
+
+```bash
+coral serve --port 8731                    # all corals in ~/corals/registry.yaml
+python3 tests/server_smoke_test.py         # ALL PASS
+python3 tests/plugin_probe.py              # ALL PASS
+```
