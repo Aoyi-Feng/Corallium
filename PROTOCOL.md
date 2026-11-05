@@ -1276,7 +1276,7 @@ grep -c '<明文>' <root>/index.db*      # 必须全是 0
 
 ## 变更记录
 
-- **v0.1.17** — 三处「协议写了、代码没做」的补齐，以及一处静默丢失：`parents` 必须存在（否则 `rel=extends` 加任意 id 就能绕过 §3.4 闸门；实测该 anomaly 已由四路审计节点写出）；投票目标必须存在（打错一位的票会永久落盘、不进任何分数——静默丢失一次评审）；`open → confirmed` 的 `≥2 sourced` 分支补上，并派生 `confirmed_level`（`challenged`/`unchallenged`），因为 `tip` 必须区分「没人反对」和「扛住攻击」。同时修正 §3.4 的候选检索：中文没有拉丁词元时旧实现按 `id`（内容哈希）序取前 240 行，同一命题是否被拦下取决于哈希大小；改为用 trigram 分词器检索中文三元组。空问题 `POST /claims` 返回 400。§6.2 补上裁决闭环：`merges` 的两个分支不再互为 rival，否则 `tip` 说已裁决、`find` 说还在打架。§2.4 的 `node` 引用也要被真的打开检查——指向不存在 id 的引用是 `missing`，不是 `ok`。同一版本还补了四处可发现性与权限缺口：`GET /claims` 让租约可读（只能写不能读的锁，在多人场景里等于没有），释放改为 holder-only（原先任何人都能删掉别人的租约）；只配 `read` token 时写请求返回 `401`（原先「没配 write token」被当成放行，只读部署实际是对所有人可写）；`/find` 命中的 `refs` 不再被计数覆盖，另给 `refs_count`（下游拿到的应是可打开的列表）；未鉴权的 `/health` 不再返回珊瑚的绝对路径。`tip?topic=` 现在只按 topic 标签取范围（标签一个都没命中才退回全文匹配）：原先「正文里提到该词」就把整段历史拉进 tip，而 tip 的用途恰恰是「现在相信什么」。
+- **v0.1.17** — 三处「协议写了、代码没做」的补齐，以及一处静默丢失：`parents` 必须存在（否则 `rel=extends` 加任意 id 就能绕过 §3.4 闸门；实测该 anomaly 已由四路审计节点写出）；投票目标必须存在（打错一位的票会永久落盘、不进任何分数——静默丢失一次评审）；`open → confirmed` 的 `≥2 sourced` 分支补上，并派生 `confirmed_level`（`challenged`/`unchallenged`），因为 `tip` 必须区分「没人反对」和「扛住攻击」。同时修正 §3.4 的候选检索：中文没有拉丁词元时旧实现按 `id`（内容哈希）序取前 240 行，同一命题是否被拦下取决于哈希大小；改为用 trigram 分词器检索中文三元组。空问题 `POST /claims` 返回 400。§6.2 补上裁决闭环：`merges` 的两个分支不再互为 rival，否则 `tip` 说已裁决、`find` 说还在打架。§2.4 的 `node` 引用也要被真的打开检查——指向不存在 id 的引用是 `missing`，不是 `ok`。同一版本还补了四处可发现性与权限缺口：`GET /claims` 让租约可读（只能写不能读的锁，在多人场景里等于没有），释放改为 holder-only（原先任何人都能删掉别人的租约）；只配 `read` token 时写请求返回 `401`（原先「没配 write token」被当成放行，只读部署实际是对所有人可写）；`/find` 命中的 `refs` 不再被计数覆盖，另给 `refs_count`（下游拿到的应是可打开的列表）；未鉴权的 `/health` 不再返回珊瑚的绝对路径。`tip?topic=` 现在只按 topic 标签取范围（标签一个都没命中才退回全文匹配）：原先「正文里提到该词」就把整段历史拉进 tip，而 tip 的用途恰恰是「现在相信什么」。维护扫描的 `counts` 改为派生直方图 `by_status`，`withdrawn` 不再读节点里恒为 `open` 的 `status`；`broken_refs` 只列活着的节点——被取代节点的坏证据不是待修项。
 - **v0.1.16** — 扫描不再把已合并/已取代的节点列为重复候选（否则每次扫描都把已裁决的事重新端上来，真正待决的对被噪音淹没）
 - **v0.1.15** — §20 维护模式：L1 `link`/投票、L2 `merge`、L3 `retire`（四条机器可查门槛）、`GET /maintenance/scan`；维护行为本身记为节点
 - **v0.1.14** — §13.10 并发契约：accept 队列 256、租约落盘移入写者队列（同一连接、唯一 tmp）、`ttl<=0` 即释放；实测 100 并发 0 数据损坏
@@ -1362,8 +1362,11 @@ grep -c '<明文>' <root>/index.db*      # 必须全是 0
 GET /maintenance/scan
 # {"duplicates":[{"a":…,"b":…,"similarity":0.94,"linked":false}],
 #  "orphans":[…], "broken_refs":[…], "junk":[{"id":…,"why":"no children, no votes, ★1"}],
-#  "counts":{"nodes":79,"roots":54,"withdrawn":6}}
+#  "counts":{"nodes":79,"roots":54,"withdrawn":6,
+#            "by_status":{"open":40,"confirmed":9,"contested":3,"suspect":2,"withdrawn":6}}}
 ```
 
 报告只给事实，不给建议。选哪条合并是判断，判断由人（或维护 agent）做出并留痕。
+
+**`counts.withdrawn` 是派生值，不是节点里存的 `status`**（后者在 v0.1.6 之后几乎恒为 `open`）。`by_status` 给出完整直方图——回答「这个珊瑚现在什么样」要的是它，而不是最后几条节点。`broken_refs` 只列**活着**的节点：被 `supersedes`／撤稿的节点即使证据文件不在，也不再是需要修的对象，每次扫描重列它只会把真正待修的那条挤下去（与 v0.1.16 对 `duplicates` 的修法同一理由）。
 

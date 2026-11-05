@@ -1003,9 +1003,15 @@ class Store:
                 and table[n["id"]]["derived_status"] != "withdrawn"
                 and n["id"] not in resolved]
         dups, seen = [], set()
+        # A withdrawn node is settled history, whether it appears as `a` or as
+        # `b`: `live` filters the left side, but `_candidates` could still return
+        # a superseded node on the right, re-surfacing exactly the pair a
+        # supersede had resolved.
+        gone = {i for i, v in table.items() if v["derived_status"] == "withdrawn"}
         for n in live:
             for cand in self._candidates(n.get("p", ""), n.get("o", ""), limit=12):
-                if cand["id"] == n["id"] or cand["similarity"] < 0.62:
+                if (cand["id"] == n["id"] or cand["id"] in gone
+                        or cand["similarity"] < 0.62):
                     continue
                 key = tuple(sorted((n["id"], cand["id"])))
                 if key in seen:

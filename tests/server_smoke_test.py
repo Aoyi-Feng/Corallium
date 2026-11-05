@@ -468,9 +468,11 @@ def main():
                                "topics": ["D"], "rel": "supersedes", "parents": [dead["id"]]})
         sc = req(a.port, "/maintenance/scan")[1]
         dead_listed = any(b.get("node") == dead["id"] for b in sc.get("broken_refs", []))
-        ok = (not dead_listed and sc["counts"].get("withdrawn", 0) >= 1
+        dead_as_dup = any(dead["id"] in (d.get("a"), d.get("b")) for d in sc.get("duplicates", []))
+        ok = (not dead_listed and not dead_as_dup
+              and sc["counts"].get("withdrawn", 0) >= 1
               and isinstance(sc["counts"].get("by_status"), dict))
-        print(f"[23] scan ignores retracted refs: listed={dead_listed} "
+        print(f"[23] scan ignores retracted refs: listed={dead_listed} as_dup={dead_as_dup} "
               f"withdrawn={sc['counts'].get('withdrawn')} by_status={sc['counts'].get('by_status')} "
               f"-> {'PASS' if ok else 'FAIL'}")
         if not ok:
