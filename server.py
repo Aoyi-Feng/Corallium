@@ -994,8 +994,14 @@ class Store:
         resolved = {p_ for n in alln
                     if n.get("rel") in ("merges", "supersedes")
                     for p_ in (n.get("parents") or [])}
+        # Derived status, not the stored field: `status` is `open` on every node
+        # ever written (v0.1.6), so filtering on it kept superseded nodes in the
+        # candidate list forever — a duplicate pair stays in the report after a
+        # `supersedes` because the old node's stored status never changes.
+        table = self._annotate_all(alln)
         live = [n for n in alln if n.get("type") in ("claim", "anomaly", "question")
-                and n.get("status") != "withdrawn" and n["id"] not in resolved]
+                and table[n["id"]]["derived_status"] != "withdrawn"
+                and n["id"] not in resolved]
         dups, seen = [], set()
         for n in live:
             for cand in self._candidates(n.get("p", ""), n.get("o", ""), limit=12):
@@ -1010,8 +1016,14 @@ class Store:
                              "linked": (cand["id"] in (n.get("parents") or [])
                                         or n["id"] in (cand.get("parents") or []))})
         roots = [n for n in live if not (n.get("parents") or [])]
+        # Only live nodes' refs: a retracted claim's missing evidence is not a
+        # maintenance item — nobody should re-check it, and re-listing it every
+        # scan (as the superseded node kept doing) is exactly the noise v0.1.16
+        # removed from `duplicates`.
         broken = [{"node": n["id"], "path": r.get("path")}
-                  for n in alln for r in (n.get("refs") or [])
+                  for n in alln
+                  if table[n["id"]]["derived_status"] != "withdrawn"
+                  for r in (n.get("refs") or [])
                   if r.get("path") and not Path(r["path"]).is_file()]
         junk = []
         for n in live:
@@ -1027,10 +1039,17 @@ class Store:
                              "why": "no children, no votes, ★%s" % n.get("significance", 3),
                              "author": n.get("author"), "junk_votes": jv,
                              "retirable": bool(jv)})
+        by_status: dict[str, int] = {}
+        for n in alln:
+            st = table[n["id"]]["derived_status"]
+            by_status[st] = by_status.get(st, 0) + 1
         return {"duplicates": dups[:50], "orphans": [n["id"] for n in roots][:100],
                 "broken_refs": broken, "junk": junk[:50],
                 "counts": {"nodes": len(alln), "roots": len(roots),
-                           "withdrawn": sum(1 for n in alln if n.get("status") == "withdrawn"),
+                           # stored `status: withdrawn` is nearly always 0; this
+                           # is the derived count (explicit retractions included)
+                           "withdrawn": by_status.get("withdrawn", 0),
+                           "by_status": by_status,
                            "duplicate_pairs": len(dups), "junk": len(junk)}}
 
     def merge(self, keep: str, drop: str, reason: str, author: str) -> dict:

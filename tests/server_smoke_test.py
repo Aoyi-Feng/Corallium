@@ -458,6 +458,23 @@ def main():
         print(f"[22] bad cursor: {code_bad} -> {'PASS' if ok else 'FAIL'}")
         if not ok:
             fails.append(22)
+        # 23 — the maintenance report must not flag evidence of a retracted node:
+        #      its missing ref is nobody's job, and re-listing it every scan is
+        #      noise that hides real ones. `withdrawn` must be the derived count.
+        dead = req(a.port, "/nodes", {"s": "D", "p": "gone", "o": "a retracted claim with bad evidence",
+                                      "author": "a", "topics": ["D"],
+                                      "refs": [{"path": "/no/such/file"}]})[1]["node"]
+        req(a.port, "/nodes", {"s": "D", "p": "gone", "o": "the correction", "author": "a",
+                               "topics": ["D"], "rel": "supersedes", "parents": [dead["id"]]})
+        sc = req(a.port, "/maintenance/scan")[1]
+        dead_listed = any(b.get("node") == dead["id"] for b in sc.get("broken_refs", []))
+        ok = (not dead_listed and sc["counts"].get("withdrawn", 0) >= 1
+              and isinstance(sc["counts"].get("by_status"), dict))
+        print(f"[23] scan ignores retracted refs: listed={dead_listed} "
+              f"withdrawn={sc['counts'].get('withdrawn')} by_status={sc['counts'].get('by_status')} "
+              f"-> {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            fails.append(23)
         stop(srv)
     finally:
         if srv is not None:
