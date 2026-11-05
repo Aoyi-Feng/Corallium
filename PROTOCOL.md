@@ -1,4 +1,4 @@
-# Corallium Protocol v0.1.9
+# Corallium Protocol v0.1.10
 
 > 名字来自珊瑚：新珊瑚虫长在旧骨骼上，一层层叠，分支形态本身就是历史。
 
@@ -897,13 +897,56 @@ purge <id> --reason "含 API key"
 ~/corals/
 ├── registry.yaml          元索引：每个珊瑚一行说明（≤20 字）
 ├── mqsim/                 一个珊瑚 = 一个 git 仓库
-│   ├── PROTOCOL.md
+│   ├── coral.yaml         身份：名字、说明、创建时间、协议版本
+│   ├── README.md          这个珊瑚装什么、怎么查（给人看）
+│   ├── .gitignore         index.db*、claims.json
 │   ├── nodes/             一个节点一个文件，不可变，进 git
 │   ├── index.db           派生缓存，可删可重建，不进 git
 │   └── claims.json        租约，运行态，不进 git
 └── trading/
     └── ...
 ```
+
+### 16.1 一个珊瑚的完整结构
+
+**五个必需项，缺一个就不算珊瑚：**
+
+| 项 | 作用 | 丢了会怎样 |
+|---|---|---|
+| `nodes/` | **唯一真源**。一个文件一条可证伪命题 | 数据没了，别的都补不回来 |
+| `coral.yaml` | 身份：`name` / `description` / `owner` / `created` / `protocol` | 服务端能跑，但 agent 不知道这块是干什么的 |
+| `README.md` | 给人看的三行：装什么、怎么查、边界在哪 | 新 agent 只能靠猜 topic |
+| `.gitignore` | 排除 `index.db*` 与 `claims.json` | 把派生数据和租约提交进 git，历史被垃圾污染 |
+| git 本身 | 审计与分发；每个珊瑚独立 | 没法回答"这条什么时候进来的" |
+
+```yaml
+# coral.yaml
+name: mqsim
+description: MQSim 仿真器、SSD 写路径、GC
+owner: seed
+created: 2026-11-05
+protocol: 0.1.10
+```
+
+**创建：**
+
+```bash
+python3 server.py --init ~/corals/mqsim --init-name mqsim --desc "MQSim 仿真器、SSD 写路径、GC" --owner seed
+```
+
+生成 `coral.yaml`、`README.md`、`.gitignore`、`nodes/`，其余什么都不做——**不自动 `git init`，不自动启动服务**（§17）。
+
+### 16.2 什么进 git，什么不进
+
+| 进 | 不进 |
+|---|---|
+| `nodes/*.json` | `index.db`、`index.db-wal`、`index.db-shm` |
+| `coral.yaml`、`README.md`、`.gitignore` | `claims.json`（活租约，随 TTL 过期） |
+
+**判据一句话：能否从别的文件重建。** 能重建的（索引）不进；重建不了的（节点、身份）必须进。租约重建不了，但它**按设计会过期**，所以不进——这是唯一的例外，写在这里以免被当成疏漏。
+
+节点目录在一万条时约 4 MB，git 处理这个量级没有任何压力；真正的压力来自把 `index.db` 提交进去，每次写入都是几 MB 的二进制变更。
+
 
 ```yaml
 # ~/corals/registry.yaml —— agent 靠这张表决定查哪个珊瑚
@@ -1019,6 +1062,7 @@ hermes plugins enable corallium
 
 ## 变更记录
 
+- **v0.1.10** — §16.1/16.2 定义珊瑚的完整结构（`coral.yaml`/`README.md`/`.gitignore`/`nodes/`/git）与 `--init` 脚手架；`tip` 改为真正沿 `parents` 找叶子；新增撤稿级联 `suspect`（仅显式撤稿传播，`supersedes` 替换不传播）与 `attempts>5` 进 `confirmed` 的门禁；`/health` 带珊瑚 `description`/`owner`/`protocol`
 - **v0.1.9** — 新增 `significance`（1–5 星，作者声明、不投票）与派生 `dependents`；`find` 支持 `sort=significance|score|recent`。修：重建索引时重复插入 FTS 行导致同一节点出现多次
 - **v0.1.8** — 新增 §4.2.2：票本身可被投票，权重按 `1/(1+max(0,−meta)/4)` 衰减（下界 0.25），只递归一层；`/reviews?claim=` 可查任意节点（含票）的投票时间线
 - **v0.1.7** — 新增 §4.2.1：满权重要过两道闸门（`prior` 独立性 / `artifact|method` 可复核），否则降到 ±1；`refuted` 免 `prior` 但要 `artifact`。`find`/`tip` 每条结论直接带 `score`+`votes`，`/reviews` 返回逐票 `weight` 与 `capped`

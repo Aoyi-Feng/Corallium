@@ -159,6 +159,43 @@ def main():
         if not ok:
             fails.append(6)
         stop(srv)
+
+        # 7-9 — semantics: attempts gate, suspect cascade, tip follows edges
+        srv = start(a.server, root, a.port)
+        pr = req(a.port, "/nodes", {"s": "T", "p": "probe", "o": "x", "author": "z"})[1]["node"]["id"]
+        g = req(a.port, "/nodes", {"s": "T", "p": "many_tries", "o": "1.6", "author": "a",
+                                   "attempts": 9, "topics": ["T"]})[1]["node"]
+        req(a.port, f"/nodes/{g['id']}/replies",
+            {"kind": "replicated", "author": "b", "prior": pr,
+             "artifact": "cmd", "text": "re-ran, same number"})
+        st1 = req(a.port, "/find?q=many_tries")[1]["hits"][0]["derived_status"]
+        req(a.port, f"/nodes/{g['id']}/replies",
+            {"kind": "adversarial", "author": "c", "prior": pr, "artifact": "attack.py",
+             "text": "tried 5 configs, all failed"})
+        st2 = req(a.port, "/find?q=many_tries")[1]["hits"][0]["derived_status"]
+        ok = st1 == "open" and st2 == "confirmed"
+        print(f"[7] attempts>5 gate: without adversarial={st1} with={st2} -> {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            fails.append(7)
+
+        base = req(a.port, "/nodes", {"s": "T", "p": "base", "o": "1", "author": "a", "topics": ["T"]})[1]["node"]
+        mid = req(a.port, "/nodes", {"s": "T", "p": "mid", "o": "2", "author": "a",
+                                     "rel": "extends", "parents": [base["id"]], "topics": ["T"]})[1]["node"]
+        req(a.port, "/nodes", {"s": "T", "p": "base", "o": "1", "author": "a", "rel": "supersedes",
+                               "parents": [base["id"]], "status": "withdrawn", "note": "made up"})
+        stb = req(a.port, "/find?q=mid")[1]["hits"][0]["derived_status"]
+        ok = stb == "suspect"
+        print(f"[8] retraction cascade: child of withdrawn = {stb} -> {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            fails.append(8)
+
+        tips = req(a.port, "/tip?topic=T")[1]["tips"]
+        ids = {t["id"] for t in tips}
+        ok = base["id"] not in ids and mid["id"] in ids
+        print(f"[9] tip = graph leaves: superseded absent, leaf present -> {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            fails.append(9)
+        stop(srv)
     finally:
         if srv is not None:
             stop(srv)

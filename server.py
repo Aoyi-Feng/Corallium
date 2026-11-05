@@ -263,65 +263,83 @@ class Store:
             out.sort(key=lambda n: n.get("score", 0), reverse=True)
         return out[:limit], outside
 
-    def derive_status(self, node: dict, all_nodes: list[dict]) -> str:
-        """Status is computed, never written back: nodes stay immutable and the
-        answer to "what do we believe now" tracks the graph, not a stale field."""
-        if node.get("status") == "withdrawn":
+    @staticmethod
+    def _dead_sets(all_nodes: list[dict]) -> tuple[set, set]:
+        """Two different kinds of "gone", because they cascade differently.
+
+        `dead`   — explicitly retracted (status: withdrawn) plus whatever such a
+                   node supersedes. This one poisons descendants → `suspect`.
+        `replaced` — merely superseded by a newer answer. The old value is no
+                   longer the tip, but it was not wrong, so it must not make its
+                   successors suspect. A successor inherits nothing but lineage.
+        """
+        dead = {n["id"] for n in all_nodes if n.get("status") == "withdrawn"}
+        for n in all_nodes:
+            if n.get("status") == "withdrawn" and n.get("rel") == "supersedes":
+                dead.update(n.get("parents") or [])
+        replaced = set()
+        for n in all_nodes:
+            if n.get("rel") == "supersedes":
+                replaced.update(n.get("parents") or [])
+        replaced -= dead
+        return dead, replaced
+
+    def derive_status(self, node: dict, all_nodes: list[dict],
+                      by_id: dict | None = None, dead: set | None = None,
+                      replaced: set | None = None) -> str:
+        """Status is computed, never written back.
+
+        Precedence matters: withdrawn > suspect > contested > confirmed > open.
+        `suspect` is not `withdrawn` — a conclusion can still be true after
+        losing its support, so it is flagged, never auto-retracted.
+        """
+        if dead is None or replaced is None:
+            dead, replaced = self._dead_sets(all_nodes)
+        by_id = by_id or {n["id"]: n for n in all_nodes}
+        if node["id"] in dead or node.get("status") == "withdrawn":
             return "withdrawn"
+        if node["id"] in replaced:
+            return "withdrawn"  # superseded: replaced, not refuted
+
+        # retraction cascades transitively: a node whose support was withdrawn
+        # is `suspect`, however deep the withdrawal sits above it.
+        stack, seen = list(node.get("parents") or []), set()
+        while stack:
+            pid = stack.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            parent = by_id.get(pid)
+            if not parent:
+                continue
+            if pid in dead:
+                return "suspect"
+            stack.extend(parent.get("parents") or [])
+
         votes = [n for n in all_nodes if n.get("type") == "review"
                  and n.get("claim") == node["id"]
                  and n.get("author") != node.get("author")]
-        if any((v.get("kind") or v.get("p")) == "refuted" for v in votes):
+        kinds = [(v.get("kind") or v.get("p")) for v in votes]
+        if "refuted" in kinds:
             return "contested"
         rivals = [n for n in all_nodes
                   if n.get("type") == "claim" and n.get("s") == node.get("s")
                   and n.get("p") == node.get("p") and n.get("o") != node.get("o")
-                  and n.get("status") != "withdrawn"]
+                  and n["id"] not in dead and n["id"] not in replaced]
         if rivals:
             return "contested"  # two live answers to the same question
-        strong = [v for v in votes if (v.get("kind") or v.get("p")) == "adversarial"
+
+        strong = [v for v in votes
+                  if (v.get("kind") or v.get("p")) == "adversarial"
                   or ((v.get("kind") or v.get("p")) == "replicated" and v.get("prior"))]
         if strong:
+            # multiple-comparisons gate: tried 6+ configurations without anyone
+            # trying to kill it? Then it is the winner of a search, not a fact.
+            attempts = int(node.get("attempts", 1) or 1)
+            if attempts > 5 and "adversarial" not in kinds:
+                return "open"
             return "confirmed"
         return "open"
-
-    def annotate(self, nodes: list[dict]) -> list[dict]:
-        c = self._conn()
-        alln = [json.loads(b) for (b,) in c.execute("SELECT body FROM nodes").fetchall()]
-        c.close()
-        scores = self._scores(alln)
-        deps: dict[str, int] = {}
-        for n in alln:
-            for p_ in (n.get("parents") or []):
-                deps[p_] = deps.get(p_, 0) + 1
-        out = []
-        for n in nodes:
-            m = dict(n)
-            m["derived_status"] = self.derive_status(n, alln)
-            if n.get("type") == "claim":
-                sc = scores.get(n["id"], {"score": 0, "votes": 0})
-                m["score"] = sc["score"]
-                m["votes"] = sc["votes"]
-                m["significance"] = n.get("significance", 3)
-                m["dependents"] = deps.get(n["id"], 0)
-            out.append(m)
-        return out
-
-    def tip(self, topic: str) -> list[dict]:
-        c = self._conn()
-        like = f"%{topic.lower()}%"
-        cur = c.execute(
-            "SELECT body FROM nodes WHERE lower(coalesce(body,'')) LIKE ? ORDER BY seq DESC",
-            (like,),
-        )
-        rows = [json.loads(b) for (b,) in cur.fetchall()]
-        c.close()
-        if not rows:
-            return []
-        ids = {n["id"] for n in rows}
-        parented = {p for n in rows for p in (n.get("parents") or []) if p in ids}
-        tips = [n for n in rows if n["id"] not in parented and n.get("status") != "withdrawn"]
-        return self.annotate(tips or rows)
 
     @staticmethod
     def _gate(v: dict, target_author: str | None):
@@ -330,8 +348,6 @@ class Store:
         w = WEIGHTS.get(kind, 0)
         caps = []
         if kind in ("replicated", "adversarial", "refuted"):
-            # `prior` proves a replicator had not seen the conclusion first.
-            # A refutation needs no warning shot: the counter-case is the point.
             if kind != "refuted" and not v.get("prior"):
                 caps.append("no-prior")
             if not (v.get("artifact") or v.get("method")):
@@ -344,33 +360,26 @@ class Store:
         """Score every node from the vote graph. Nothing is stored.
 
         Votes on votes are allowed, but the recursion stops after one level:
-        a vote's own weight may be damped by what others said about it, while
-        votes *on those meta-votes* are recorded and ignored for scoring.
-        Without a floor the graph has no fixed point (A rates B, B rates A).
+        a vote's weight may be damped by what others said about it, while votes
+        on those meta-votes are recorded and ignored for scoring.
         """
         reviews = [n for n in alln if n.get("type") == "review"]
         by_target: dict[str, list[dict]] = {}
         for r in reviews:
             by_target.setdefault(r.get("claim"), []).append(r)
 
-        authors = {n["id"]: n.get("author") for n in alln}
         out: dict[str, dict] = {}
         for n in alln:  # reviews are scored too, so votes on a vote are listable
-            votes = []
-            total = 0.0
+            votes, total = [], 0.0
             for v in by_target.get(n["id"], []):
                 w, caps, kind = self._gate(v, n.get("author"))
                 meta = [m for m in by_target.get(v["id"], [])
                         if m.get("author") != v.get("author")]
                 meta_score = 0.0
                 for m in meta:
-                    mw, mcaps, mkind = self._gate(m, v.get("author"))
+                    mw, _, _ = self._gate(m, v.get("author"))
                     meta_score += mw
-                # -4 → ×0.5, -8 → ×0.33, floored at ×0.25 so a heavily
-                # contested piece of evidence still leaves a trace.
-                mult = 1.0 / (1.0 + max(0.0, -meta_score) / 4.0)
-                mult = max(mult, 0.25)
-                eff = w * mult
+                mult = max(1.0 / (1.0 + max(0.0, -meta_score) / 4.0), 0.25)
                 counted = v.get("author") != n.get("author")
                 votes.append({
                     "id": v["id"], "seq": v.get("seq"), "ts": v.get("ts"),
@@ -379,11 +388,11 @@ class Store:
                     "weight": w, "capped": caps,
                     "meta_score": meta_score, "meta_votes": len(meta),
                     "multiplier": round(mult, 2),
-                    "effective": round(eff, 2) if counted else 0,
+                    "effective": round(w * mult, 2) if counted else 0,
                     "counted": counted,
                 })
                 if counted:
-                    total += eff
+                    total += w * mult
             if votes:
                 out[n["id"]] = {"score": round(total, 2), "votes": len(votes),
                                 "detail": votes}
@@ -402,8 +411,58 @@ class Store:
         for v in sc["detail"]:
             if v["counted"]:
                 tally[v["kind"]] = tally.get(v["kind"], 0) + 1
-        return {"node": target, "score": sc["score"], "tally": tally,
-                "votes": sc["detail"]}
+        return {"node": target, "score": sc["score"], "tally": tally, "votes": sc["detail"]}
+
+    def annotate(self, nodes: list[dict]) -> list[dict]:
+        c = self._conn()
+        alln = [json.loads(b) for (b,) in c.execute("SELECT body FROM nodes").fetchall()]
+        c.close()
+        scores = self._scores(alln)
+        by_id = {n["id"]: n for n in alln}
+        dead, replaced = self._dead_sets(alln)
+        deps: dict[str, int] = {}
+        for n in alln:
+            for p_ in (n.get("parents") or []):
+                deps[p_] = deps.get(p_, 0) + 1
+        out = []
+        for n in nodes:
+            m = dict(n)
+            m["derived_status"] = self.derive_status(n, alln, by_id, dead, replaced)
+            if n.get("type") == "claim":
+                sc = scores.get(n["id"], {"score": 0, "votes": 0})
+                m["score"] = sc["score"]
+                m["votes"] = sc["votes"]
+                m["significance"] = n.get("significance", 3)
+                m["dependents"] = deps.get(n["id"], 0)
+            out.append(m)
+        return out
+
+    def tip(self, topic: str) -> list[dict]:
+        """Leaves of the edge graph, not a text match on the topic.
+
+        `parents` is the only structure that says "this replaced / extended
+        that", so a tip is a node that nothing else points at. Dropping
+        `withdrawn` here is what makes `tip` an answer to "what do we believe
+        now" rather than "what did we ever write".
+        """
+        c = self._conn()
+        alln = [json.loads(b) for (b,) in c.execute("SELECT body FROM nodes").fetchall()]
+        c.close()
+        if topic:
+            low = topic.lower()
+            scope = [n for n in alln
+                     if low in (n.get("topics") or [])
+                     or low in json.dumps(n, ensure_ascii=False).lower()]
+        else:
+            scope = alln
+        if not scope:
+            return []
+        ids = {n["id"] for n in scope}
+        child_of = {p for n in scope for p in (n.get("parents") or []) if p in ids}
+        tips = [n for n in scope if n["id"] not in child_of]
+        dead, replaced = self._dead_sets(alln)
+        live = [n for n in tips if n["id"] not in dead and n["id"] not in replaced]
+        return self.annotate(live or tips)
 
     def max_seq(self) -> int:
         c = self._conn()
@@ -554,7 +613,9 @@ def make_handler(corals: dict, read_token: str, write_token: str, default: str |
             # /health stays unauthenticated: systemd and monitors probe it, and
             # it leaks nothing but coral names and sequence numbers.
             if u.path == "/health":
-                meta = {n: {"path": str(s.root), "max_seq": s.max_seq()}
+                meta = {n: {"path": str(s.root), "max_seq": s.max_seq(),
+                            **{k: v for k, v in coral_meta(s.root).items()
+                               if k in ("description", "owner", "protocol")}}
                         for n, s in corals.items()}
                 return self._send(200, {
                     "ok": True, "default": default,
@@ -565,7 +626,9 @@ def make_handler(corals: dict, read_token: str, write_token: str, default: str |
                 return
             try:
                 if u.path == "/corals":
-                    meta = {n: {"path": str(s.root), "max_seq": s.max_seq()}
+                    meta = {n: {"path": str(s.root), "max_seq": s.max_seq(),
+                                **{k: v for k, v in coral_meta(s.root).items()
+                                   if k in ("description", "owner", "protocol")}}
                             for n, s in corals.items()}
                     return self._send(200, {
                         "ok": True,
@@ -619,10 +682,81 @@ def make_handler(corals: dict, read_token: str, write_token: str, default: str |
                     nid = ep[len("/nodes/"):-len("/replies")]
                     return self._send(201, store.reply(nid, payload))
                 return self._send(404, {"error": "not found"})
+            except ValueError as e:  # bad input is the caller's fault
+                return self._send(400, {"error": str(e)})
             except Exception as e:
                 return self._send(500, {"error": f"{type(e).__name__}: {e}"})
 
     return H
+
+
+def coral_meta(root: Path) -> dict:
+    """coral.yaml: the identity of one coral, readable by a human in 10 seconds."""
+    f = root / "coral.yaml"
+    meta = {"name": root.name, "description": ""}
+    if not f.exists():
+        return meta
+    for line in f.read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if ":" in line:
+            k, v = line.split(":", 1)
+            meta[k.strip()] = v.strip()
+    return meta
+
+
+CORAL_GITIGNORE = """index.db
+index.db-wal
+index.db-shm
+claims.json
+__pycache__/
+"""
+
+CORAL_README = """# {name}
+
+{desc}
+
+## What belongs here
+
+One falsifiable proposition per node. If you cannot say what would make it false,
+it is an opinion and does not belong.
+
+## Query
+
+```bash
+curl 'http://127.0.0.1:8731/c/{name}/find?q=<text>'
+curl 'http://127.0.0.1:8731/c/{name}/since?cursor=0'
+curl 'http://127.0.0.1:8731/c/{name}/tip?topic=<topic>'
+```
+
+## Layout
+
+- `nodes/<id>.json` — immutable; the id is a hash of the proposition
+- `claims.json` — live leases (not in git)
+- `index.db` — derived search index; delete it freely
+
+Protocol: see the Corallium repository, `PROTOCOL.md`.
+"""
+
+
+def init_coral(root: Path, name: str, desc: str, owner: str = "") -> dict:
+    if (root / "coral.yaml").exists():
+        return {"ok": False, "error": f"{root} is already a coral"}
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "nodes").mkdir(exist_ok=True)
+    version = "0.1.10"
+    vf = Path(__file__).with_name("VERSION")
+    if vf.exists():
+        version = vf.read_text().strip()
+    (root / "coral.yaml").write_text(
+        f"name: {name}\n"
+        f"description: {desc}\n"
+        f"owner: {owner}\n"
+        f"created: {datetime.now(timezone.utc).astimezone().strftime('%Y-%m-%d')}\n"
+        f"protocol: {version}\n"
+    )
+    (root / ".gitignore").write_text(CORAL_GITIGNORE)
+    (root / "README.md").write_text(CORAL_README.format(name=name, desc=desc))
+    return {"ok": True, "root": str(root), "name": name}
 
 
 def load_registry(path: Path) -> dict[str, str]:
@@ -662,9 +796,20 @@ def main() -> int:
     ap.add_argument("--coral", action="append", default=[],
                     metavar="NAME=PATH", help="add a coral (repeatable)")
     ap.add_argument("--registry", default="", help="registry.yaml listing several corals")
+    ap.add_argument("--init", default="", metavar="DIR",
+                    help="scaffold a new coral and exit")
+    ap.add_argument("--init-name", default="")
+    ap.add_argument("--desc", default="")
+    ap.add_argument("--owner", default="")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--bind", default="0.0.0.0")
     a = ap.parse_args()
+
+    if a.init:
+        root = Path(a.init).expanduser()
+        r = init_coral(root, a.init_name or root.name, a.desc, a.owner)
+        print(json.dumps(r, ensure_ascii=False))
+        return 0 if r["ok"] else 1
 
     roots: dict[str, Path] = {}
     if a.registry:
