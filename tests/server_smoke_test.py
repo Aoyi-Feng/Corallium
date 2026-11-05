@@ -12,6 +12,7 @@ Exit code 0 = all passed.
 """
 import argparse, concurrent.futures as cf, glob, json, os, shutil, socket
 import subprocess, sys, tempfile, time, urllib.error, urllib.request
+from pathlib import Path
 
 
 def free_port():
@@ -195,6 +196,29 @@ def main():
         print(f"[9] tip = graph leaves: superseded absent, leaf present -> {'PASS' if ok else 'FAIL'}")
         if not ok:
             fails.append(9)
+        stop(srv)
+
+        # 10 — file references: pinned at write, live-checked, missing -> suspect
+        srv = start(a.server, root, a.port)
+        f = Path(root) / "evidence.csv"
+        f.write_text("run,iops\n1,22558\n")
+        ref = req(a.port, "/nodes", {"s": "T", "p": "ref", "o": "22,558",
+                                     "author": "a", "topics": ["T"],
+                                     "refs": [{"path": "evidence.csv"}]})[1]["node"]
+        ok_pin = bool(ref["refs"][0].get("sha256"))
+        st_ok = req(a.port, "/find?q=22,558")[1]["hits"][0]["derived_status"]
+        f.write_text("run,iops\n1,22558\n2,900\n")
+        v = req(a.port, "/verify?node=" + ref["id"])[1]
+        st_chg = req(a.port, "/find?q=22,558")[1]["hits"][0]["derived_status"]
+        f.unlink()
+        v2 = req(a.port, "/verify?node=" + ref["id"])[1]
+        st_gone = req(a.port, "/find?q=22,558")[1]["hits"][0]["derived_status"]
+        ok = (ok_pin and st_ok == "open" and v["changed"] == 1 and st_chg == "open"
+              and v2["missing"] == 1 and st_gone == "suspect")
+        print(f"[10] refs: pinned={ok_pin} changed={v['changed']}/{st_chg} "
+              f"missing={v2['missing']}/{st_gone} -> {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            fails.append(10)
         stop(srv)
     finally:
         if srv is not None:

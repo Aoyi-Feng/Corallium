@@ -86,6 +86,16 @@ A coral directory is small enough to read in one breath:
 └── .git/
 ```
 
+References are checked, not quoted. A node can point at a file; the server hashes
+it at write time, so months later you can ask whether the evidence still exists:
+
+```bash
+GET /verify?node=<id>
+# {"ok": 3, "changed": 0, "missing": 0}
+```
+
+A missing file makes the claim `suspect` — nobody can recheck it any more.
+
 A coral also records what is not done yet. A `task` node must state its completion
 condition, and closes when some node lists it as a parent:
 

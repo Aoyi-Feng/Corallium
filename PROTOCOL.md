@@ -1,4 +1,4 @@
-# Corallium Protocol v0.1.11
+# Corallium Protocol v0.1.12
 
 > 名字来自珊瑚：新珊瑚虫长在旧骨骼上，一层层叠，分支形态本身就是历史。
 
@@ -116,7 +116,11 @@ agent 靠这一行决定查哪儿。
   "topics": ["MQSim", "flash-write"],
   "method": {"config": "configs/970pro_realgeom.xml", "cmd": "05_run.py --workload seq_write_128k", "version": "MQSim@a1b2c3", "seed": null},
   "attempts": 1,
-  "note": ""
+  "note": "",
+  "refs": [
+    {"path": "/home/seed/ssd-pipeline/runs.csv", "lines": "12-45",
+     "sha256": "<写入时服务器算的>", "size": 8412, "missing": false}
+  ]
 }
 ```
 
@@ -148,6 +152,38 @@ agent 靠这一行决定查哪儿。
 - `dependents`（派生）：有多少节点挂在它下面（`parents` 里含它）。这是客观的，且不投票。
 
 检索时可排序：`GET /find?q=…&sort=significance|score|recent`。**默认按 recency**，因为绝大多数查询是要"最新的那个答案"；按重要性排是**开工前决定先攻哪块**用的。
+
+### 2.4 文件引用
+
+**引用不是字符串，是一条可复核的指针。**
+
+`artifact: "scripts/v_replicate.py @3f2a1c"` 只是给人看的字；`refs` 是给机器验的：
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `path` | 二选一 | 绝对路径，或**相对珊瑚根**的路径 |
+| `node` | 二选一 | 指向同库另一节点（跨珊瑚用 `coral`） |
+| `lines` | 否 | 行号范围，如 `"12-45"`，用于"只引其中一段" |
+| `sha256` | **服务器填写** | 写入那一刻文件的内容哈希，作者不可指定 |
+| `missing` | 服务器填写 | 写入时文件是否已经不在 |
+
+**哈希由服务器在写入时算，不由作者报。** 否则作者可以给一个早已不存在的文件编个哈希，下游所有人都以为证据还在。
+
+| 状态 | 含义 | 后果 |
+|---|---|---|
+| `ok` | 文件在，哈希一致 | 正常 |
+| `changed` | 文件在，内容变了 | `/verify` 报出；**不改状态** |
+| `missing` | 文件没了 | **该节点派生为 `suspect`** |
+
+**为什么 `changed` 不降级而 `missing` 降级**：改内容可能只是追加数据行，要人看；文件没了则谁都无法复核，不需要人看。
+
+```bash
+GET /verify            # 整库
+GET /verify?node=<id>  # 单条
+# {"ok": 3, "changed": 1, "missing": 0, "refs": [...]}
+```
+
+**已知边界**：只按整文件哈希。两人分别追加同一文件时，`changed` 会报警但内容可能完全兼容——这时应引 `lines` 范围，或指向一份快照。
 
 ---
 
@@ -1071,6 +1107,7 @@ hermes plugins enable corallium
 
 ## 变更记录
 
+- **v0.1.12** — 新增 `refs` 文件引用（路径 + 写入时 sha256 + 行号）与 `GET /verify`；引用文件消失 → 节点派生 `suspect`；`changed` 只报警不降级
 - **v0.1.11** — 新增第六种节点类型 `task`（`o` 必须写完成条件；被放进某节点 `parents` 即视为关闭）与 `GET /tasks`；`task` 让「还没做的事」和「已知的事实」共用同一张图
 - **v0.1.10** — §16.1/16.2 定义珊瑚的完整结构（`coral.yaml`/`README.md`/`.gitignore`/`nodes/`/git）与 `--init` 脚手架；`tip` 改为真正沿 `parents` 找叶子；新增撤稿级联 `suspect`（仅显式撤稿传播，`supersedes` 替换不传播）与 `attempts>5` 进 `confirmed` 的门禁；`/health` 带珊瑚 `description`/`owner`/`protocol`
 - **v0.1.9** — 新增 `significance`（1–5 星，作者声明、不投票）与派生 `dependents`；`find` 支持 `sort=significance|score|recent`。修：重建索引时重复插入 FTS 行导致同一节点出现多次

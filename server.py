@@ -300,6 +300,14 @@ class Store:
             return "withdrawn"
         if node["id"] in replaced:
             return "withdrawn"  # superseded: replaced, not refuted
+        # Check existence live, not the flag stored at write time: a file that
+        # existed then and is gone now is exactly the case this is for. One stat
+        # per ref is cheap; hashing is left to GET /verify.
+        for r in node.get("refs") or []:
+            if r.get("path") and not Path(r["path"]).is_file():
+                return "suspect"
+        if any(r.get("missing") for r in (node.get("refs") or [])):
+            return "suspect"  # the evidence file is gone; the claim is uncheckable
 
         # retraction cascades transitively: a node whose support was withdrawn
         # is `suspect`, however deep the withdrawal sits above it.
@@ -449,6 +457,12 @@ class Store:
         for n in nodes:
             m = dict(n)
             m["derived_status"] = self.derive_status(n, alln, by_id, dead, replaced)
+            if n.get("refs"):
+                m["refs"] = len(n["refs"])
+                m["refs_missing"] = sum(1 for r in n["refs"] if r.get("missing"))
+            rs = n.get("refs") or []
+            if rs:
+                m["refs"] = len(rs)
             if n.get("type") == "claim":
                 sc = scores.get(n["id"], {"score": 0, "votes": 0})
                 m["score"] = sc["score"]
@@ -492,6 +506,64 @@ class Store:
         return int(v)
 
     # -- writes (queued) ---------------------------------------------------
+    def _pin_refs(self, node: dict) -> None:
+        """A reference is a path plus the hash of what was there when it was made.
+
+        Pinning at write time is the point: the author cannot later claim the file
+        said something it never said, and months later we can tell whether the
+        evidence still exists. Files change; nodes do not.
+        """
+        refs = node.get("refs") or []
+        if not isinstance(refs, list):
+            raise ValueError("refs must be a list")
+        pinned = []
+        for r in refs:
+            if not isinstance(r, dict) or not (r.get("path") or r.get("node")):
+                raise ValueError("each ref needs path or node")
+            r = dict(r)
+            if r.get("node"):
+                pinned.append(r)  # node-to-node: the store resolves it, not the filesystem
+                continue
+            f = Path(r["path"]).expanduser()
+            if not f.is_absolute():
+                f = self.root / f
+            r["path"] = str(f)
+            if f.is_file():
+                r["sha256"] = hashlib.sha256(f.read_bytes()).hexdigest()
+                r["size"] = f.stat().st_size
+                r["missing"] = False
+            else:
+                r["missing"] = True
+                r.pop("sha256", None)
+            pinned.append(r)
+        node["refs"] = pinned
+
+    def verify_refs(self, node_id: str | None = None) -> dict:
+        """Re-hash every reference: is the evidence still there, and still the same?"""
+        c = self._conn()
+        rows = (c.execute("SELECT body FROM nodes WHERE id=?", (node_id,)).fetchall()
+                if node_id else c.execute("SELECT body FROM nodes").fetchall())
+        c.close()
+        out = []
+        for (b,) in rows:
+            n = json.loads(b)
+            for i, r in enumerate(n.get("refs") or []):
+                if r.get("node"):
+                    out.append({"node": n["id"], "i": i, "ref": r, "state": "node"})
+                    continue
+                f = Path(r["path"])
+                if not f.is_file():
+                    out.append({"node": n["id"], "i": i, "ref": r, "state": "missing"})
+                    continue
+                cur = hashlib.sha256(f.read_bytes()).hexdigest()
+                out.append({"node": n["id"], "i": i, "ref": r,
+                            "state": "ok" if cur == r.get("sha256") else "changed",
+                            "now": cur})
+        return {"refs": out,
+                "ok": sum(1 for x in out if x["state"] in ("ok", "node")),
+                "changed": sum(1 for x in out if x["state"] == "changed"),
+                "missing": sum(1 for x in out if x["state"] == "missing")}
+
     def add_node(self, payload: dict) -> dict:
         def job(c):
             s, p, o = payload.get("s"), payload.get("p"), payload.get("o")
@@ -529,6 +601,9 @@ class Store:
             for k in ("claim", "prior", "kind", "artifact"):
                 if payload.get(k):
                     node[k] = payload[k]
+            if payload.get("refs"):
+                node["refs"] = payload["refs"]
+                self._pin_refs(node)
 
             # file first: it is the truth, and O_EXCL makes the write atomic
             path = self.nodes_dir / f"{nid}.json"
@@ -670,6 +745,8 @@ def make_handler(corals: dict, read_token: str, write_token: str, default: str |
                     return self._send(200, {"nodes": store.since(cursor, topics)})
                 if ep == "/tip":
                     return self._send(200, {"tips": store.tip(q.get("topic", [""])[0])})
+                if ep == "/verify":
+                    return self._send(200, store.verify_refs(q.get("node", [None])[0]))
                 if ep == "/tasks":
                     return self._send(200, {"tasks": store.tasks(
                         include_closed=(q.get("all", ["0"])[0] == "1"))})
