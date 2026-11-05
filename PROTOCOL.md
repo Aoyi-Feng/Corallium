@@ -1,4 +1,4 @@
-# Corallium Protocol v0.1.18
+# Corallium Protocol v0.1.19
 
 > 名字来自珊瑚：新珊瑚虫长在旧骨骼上，一层层叠，分支形态本身就是历史。
 
@@ -956,6 +956,31 @@ trading: 动量模型、组合、因子
 
 租约（`claims.json`）**不属于派生数据**：`index.db` 可以随便删，租约不行。删掉索引只会重建，删掉租约会让两个 agent 同时开工。
 
+### 13.11 代码的模块边界
+
+一个 1 588 行的 `server.py` 是真实的故障源，不是审美问题：两个 agent 同时改它时，git 按行合并，**几十行看起来连贯的 diff 里可以悄悄抹掉另一个人的语义**，没有任何冲突提示。所以服务端拆成包，`server.py` 只剩一层壳（systemd、`coral serve`、冒烟测试都仍指向它）：
+
+```
+server.py              入口壳：from corallium.main import main
+corallium/
+├── store.py      397   Storage：连接、索引重建、租约、写者队列、refs 钉住 — 组装 Store
+├── derive.py     367   派生：status / score / tip / tasks / claims / reviews
+├── write.py      281   写入路径：近似度闸门、add_node、claim、reply
+├── maint.py      266   §20 维护：scan / merge / retire / purge / tombstone
+├── http.py       198   HTTP：make_handler（多珊瑚路由、token、UTF-8 查询）
+├── registry.py    84   coral.yaml、registry.yaml、--init 脚手架、VERSION
+├── main.py        81   参数、起服务、accept 队列 256
+└── errors.py      12   ApiError（自带 HTTP 状态，从写者 job 里抛出）
+```
+
+三条约束：
+
+- **任何模块 < 400 行。** 超过就说明一个模块承担了两件事，按「谁拥有这块状态」再切，不按文件长度硬切。
+- **只有一个写者队列。** 并发契约（§13.10）的全部保证依赖「所有变更走同一条队列、同一个线程」。拆模块不允许拆出第二条写路径——`write.py` / `maint.py` 里的每个变更函数都返回一个 `job(c)` 交给 `self._run`，没有例外。
+- **`Store` 由 mixin 组合**（`Storage + Derive + Write + Maint`），所以 `self.` 调用跨模块和跨方法没有区别；换文件不改变任何行为，这也是这次拆分能用同一套 24 条冒烟断言验证的原因。
+
+测试只依赖公开接口（HTTP 端点、`server.py` 进程），不 import 内部模块——否则拆分就变成了改测试。
+
 ---
 
 ## 14. 撤销与清除
@@ -1283,6 +1308,7 @@ grep -c '<明文>' <root>/index.db*      # 必须全是 0
 
 ## 变更记录
 
+- **v0.1.19** — 服务端拆成包（§13.11）：`server.py` 从 1 588 行降到 12 行入口壳，代码进 `corallium/`（store 397 / derive 367 / write 281 / maint 266 / http 198 / registry 84 / main 81 / errors 12，全部 < 400）。理由不是审美：单文件下两个 agent 的改动按行合并，谁的语义被抹掉不会有任何冲突提示。`Store` 由四个 mixin 组合，`self.` 调用跨文件不变，所以行为不变——24 条冒烟断言在拆分前后逐条 PASS（含 v0.1.18 的父边闸门 [24]）。唯一的行为相关改动：`server_version()` 的 `VERSION` 路径改成包的上两层，否则 `/health` 会报 `unknown`。
 - **v0.1.18** — 父边不再是 §3.4 闸门的豁免。旧规则「带 `parents` 就 201」被实测利用成免检通道：同一作者以 `rel=extends` 写入了两对相似度 1.00 的重复节点（129/135、131/132），无票无 409。现在闸门对带父边的命题同样运行，只是阈值抬到 0.90——0.62 管「横向长了个近似的根」，0.90 管「纵向把同一句话再说一遍」；原因是 `extends` 天然复述父亲的一部分，用 0.62 拦它会让 agent 学会无脑 `force`，闸门反而失效。409 的候选列表里标注 `similar_to_parent`，出路是 `force`+`why_new` 或 `rel=supersedes`。
 - **v0.1.17** — 三处「协议写了、代码没做」的补齐，以及一处静默丢失：`parents` 必须存在（否则 `rel=extends` 加任意 id 就能绕过 §3.4 闸门；实测该 anomaly 已由四路审计节点写出）；投票目标必须存在（打错一位的票会永久落盘、不进任何分数——静默丢失一次评审）；`open → confirmed` 的 `≥2 sourced` 分支补上，并派生 `confirmed_level`（`challenged`/`unchallenged`），因为 `tip` 必须区分「没人反对」和「扛住攻击」。同时修正 §3.4 的候选检索：中文没有拉丁词元时旧实现按 `id`（内容哈希）序取前 240 行，同一命题是否被拦下取决于哈希大小；改为用 trigram 分词器检索中文三元组。空问题 `POST /claims` 返回 400。§6.2 补上裁决闭环：`merges` 的两个分支不再互为 rival，否则 `tip` 说已裁决、`find` 说还在打架。§2.4 的 `node` 引用也要被真的打开检查——指向不存在 id 的引用是 `missing`，不是 `ok`。同一版本还补了四处可发现性与权限缺口：`GET /claims` 让租约可读（只能写不能读的锁，在多人场景里等于没有），释放改为 holder-only（原先任何人都能删掉别人的租约）；只配 `read` token 时写请求返回 `401`（原先「没配 write token」被当成放行，只读部署实际是对所有人可写）；`/find` 命中的 `refs` 不再被计数覆盖，另给 `refs_count`（下游拿到的应是可打开的列表）；未鉴权的 `/health` 不再返回珊瑚的绝对路径。`tip?topic=` 现在只按 topic 标签取范围（标签一个都没命中才退回全文匹配）：原先「正文里提到该词」就把整段历史拉进 tip，而 tip 的用途恰恰是「现在相信什么」。维护扫描的 `counts` 改为派生直方图 `by_status`，`withdrawn` 不再读节点里恒为 `open` 的 `status`；`broken_refs` 只列活着的节点——被取代节点的坏证据不是待修项。
 - **v0.1.16** — 扫描不再把已合并/已取代的节点列为重复候选（否则每次扫描都把已裁决的事重新端上来，真正待决的对被噪音淹没）

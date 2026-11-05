@@ -1,0 +1,266 @@
+"""Maintenance mode: repairing the shape, not adding knowledge (PROTOCOL §20).
+
+L1 link/vote, L2 merge, L3 retire. L3 destroys the payload and leaves a
+tombstone; it needs a recorded non-author accusation, because structure can
+prove "nobody would miss it" and never "it is wrong".
+"""
+
+from .errors import ApiError
+import hashlib
+import json
+import os
+import sqlite3
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from queue import Queue
+
+# A tombstone occupies the same slot the node occupied: same id, same seq, same
+# ts. Everything that was content is gone. `status: withdrawn` is not decoration:
+# `_dead_sets` keys on it, so children become `suspect` with no extra machinery.
+TOMBSTONE_KEYS = ("id", "seq", "ts", "type", "status", "purged_at", "reason", "author")
+
+
+class Maint:
+    """Curator actions: scan, merge, retire, purge."""
+
+    def scan(self) -> dict:
+        """Facts only. Which duplicate to merge is a judgement, and judgements
+        leave a node behind — a scan that also recommends would launder that."""
+        alln = self._all()
+        children: dict[str, int] = {}
+        votes: dict[str, int] = {}
+        for n in alln:
+            for p_ in (n.get("parents") or []):
+                children[p_] = children.get(p_, 0) + 1
+            if n.get("type") == "review" and n.get("claim"):
+                votes[n["claim"]] = votes.get(n["claim"], 0) + 1
+        # Already-resolved nodes are not candidates: a merge or a supersede is a
+        # decision, and re-listing its inputs every scan turns the report into
+        # noise that hides the pairs that still need someone to decide.
+        resolved = {p_ for n in alln
+                    if n.get("rel") in ("merges", "supersedes")
+                    for p_ in (n.get("parents") or [])}
+        # Derived status, not the stored field: `status` is `open` on every node
+        # ever written (v0.1.6), so filtering on it kept superseded nodes in the
+        # candidate list forever — a duplicate pair stays in the report after a
+        # `supersedes` because the old node's stored status never changes.
+        table = self._annotate_all(alln)
+        live = [n for n in alln if n.get("type") in ("claim", "anomaly", "question")
+                and table[n["id"]]["derived_status"] != "withdrawn"
+                and n["id"] not in resolved]
+        dups, seen = [], set()
+        # A withdrawn node is settled history, whether it appears as `a` or as
+        # `b`: `live` filters the left side, but `_candidates` could still return
+        # a superseded node on the right, re-surfacing exactly the pair a
+        # supersede had resolved.
+        gone = {i for i, v in table.items() if v["derived_status"] == "withdrawn"}
+        for n in live:
+            for cand in self._candidates(n.get("p", ""), n.get("o", ""), limit=12):
+                if (cand["id"] == n["id"] or cand["id"] in gone
+                        or cand["similarity"] < 0.62):
+                    continue
+                key = tuple(sorted((n["id"], cand["id"])))
+                if key in seen:
+                    continue
+                seen.add(key)
+                dups.append({"a": n["id"], "b": cand["id"],
+                             "similarity": cand["similarity"],
+                             "linked": (cand["id"] in (n.get("parents") or [])
+                                        or n["id"] in (cand.get("parents") or []))})
+        roots = [n for n in live if not (n.get("parents") or [])]
+        # Only live nodes' refs: a retracted claim's missing evidence is not a
+        # maintenance item — nobody should re-check it, and re-listing it every
+        # scan (as the superseded node kept doing) is exactly the noise v0.1.16
+        # removed from `duplicates`.
+        broken = [{"node": n["id"], "path": r.get("path")}
+                  for n in alln
+                  if table[n["id"]]["derived_status"] != "withdrawn"
+                  for r in (n.get("refs") or [])
+                  if r.get("path") and not Path(r["path"]).is_file()]
+        junk = []
+        for n in live:
+            if n.get("type") == "decision":
+                continue
+            if (children.get(n["id"], 0) == 0 and votes.get(n["id"], 0) == 0
+                    and int(n.get("significance", 3)) <= 2 and not (n.get("refs"))):
+                jv = sum(1 for x in alln if x.get("type") == "review"
+                         and x.get("claim") == n["id"]
+                         and (x.get("kind") or x.get("p")) == "junk"
+                         and x.get("author") != n.get("author"))
+                junk.append({"id": n["id"], "o": n.get("o", "")[:60],
+                             "why": "no children, no votes, ★%s" % n.get("significance", 3),
+                             "author": n.get("author"), "junk_votes": jv,
+                             "retirable": bool(jv)})
+        by_status: dict[str, int] = {}
+        for n in alln:
+            st = table[n["id"]]["derived_status"]
+            by_status[st] = by_status.get(st, 0) + 1
+        return {"duplicates": dups[:50], "orphans": [n["id"] for n in roots][:100],
+                "broken_refs": broken, "junk": junk[:50],
+                "counts": {"nodes": len(alln), "roots": len(roots),
+                           # stored `status: withdrawn` is nearly always 0; this
+                           # is the derived count (explicit retractions included)
+                           "withdrawn": by_status.get("withdrawn", 0),
+                           "by_status": by_status,
+                           "duplicate_pairs": len(dups), "junk": len(junk)}}
+
+
+    def merge(self, keep: str, drop: str, reason: str, author: str) -> dict:
+        """L2: one node that stands for both. Nothing is destroyed — the merge
+        node's `parents` are exactly what makes tip stop showing either."""
+        alln = {n["id"]: n for n in self._all()}
+        for i in (keep, drop):
+            if i not in alln:
+                raise ApiError(404, f"unknown node {i}")
+        if keep == drop:
+            raise ValueError("keep and drop are the same node")
+        if not reason.strip():
+            raise ValueError("reason is required: a merge without a reason cannot be reviewed")
+        a, b = alln[keep], alln[drop]
+        r = self.add_node({"s": a.get("s", ""), "p": a.get("p", ""), "o": a.get("o", ""),
+                           "author": author, "type": "decision", "rel": "merges",
+                           "parents": [keep, drop], "topics": a.get("topics") or [],
+                           "significance": max(int(a.get("significance", 3)),
+                                               int(b.get("significance", 3))),
+                           "note": reason, "force": True,
+                           "why_new": "merge of %s and %s" % (keep, drop)})
+        return {"merged": r["node"]["id"], "keep": keep, "drop": drop,
+                "created": r["created"]}
+
+
+    def retire(self, node_id: str, reason: str, author: str) -> dict:
+        """L3: destroy content. Four machine-checkable conditions, because the
+        cost of being wrong is asymmetric: leftover junk is noise, deleting a
+        node someone builds on is an irreversible loss."""
+        alln = self._all()
+        by = {n["id"]: n for n in alln}
+        n = by.get(node_id)
+        if not n:
+            raise ApiError(404, f"unknown node {node_id}")
+        children = [x["id"] for x in alln if node_id in (x.get("parents") or [])]
+        # A `junk` vote is the accusation, not a defence: it must not close the
+        # "nobody has judged this" gate, or the accusation would veto itself.
+        votes = [x["id"] for x in alln if x.get("type") == "review"
+                 and x.get("claim") == node_id
+                 and (x.get("kind") or x.get("p")) != "junk"]
+        fails = []
+        if children:
+            fails.append(f"has {len(children)} child node(s): {children[:3]}")
+        if votes:
+            fails.append(f"has {len(votes)} vote(s): {votes[:3]}")
+        if int(n.get("significance", 3)) > 2:
+            fails.append(f"significance is {n.get('significance')} (retire allows <=2)")
+        if n.get("refs"):
+            fails.append("has file references: it is evidence-backed, not junk")
+        junk_votes = [x["id"] for x in alln if x.get("type") == "review"
+                      and x.get("claim") == node_id
+                      and (x.get("kind") or x.get("p")) == "junk"
+                      and x.get("author") != n.get("author")]
+        if not junk_votes:
+            # Structural gates say "nobody would miss it"; they cannot say
+            # "it is wrong". That claim has to be made by someone, on the
+            # record, before anything is destroyed.
+            fails.append("no `junk` vote: nothing has accused this node of being a mistake")
+        if fails:
+            raise ApiError(409, "refusing to retire: " + "; ".join(fails))
+        return self.purge(node_id, reason, author)
+
+
+    def purge(self, node_id: str, reason: str, author: str) -> dict:
+        """Destroy one node's payload, keep its place in the graph (PROTOCOL §14.3).
+
+        Nodes are immutable; this is the single sanctioned exception, and only
+        for secrets. Three things must all be true afterwards, or the purge is a
+        lie:
+
+          1. the payload is not in the file (rewritten, not appended to),
+          2. the payload is not in the index (FTS rows deleted, not shadowed),
+          3. the id still resolves, so `parents: [id]` does not dangle.
+
+        (3) is why this is a tombstone and not a delete: a child that lost its
+        parent silently becomes an orphan that still looks confirmed. Status
+        `withdrawn` feeds `_dead_sets`, which is what turns those children
+        `suspect` — the retraction cascade falls out of the state machine instead
+        of being re-implemented here.
+        """
+        node_id = (node_id or "").strip()
+        reason = (reason or "").strip()
+        author = (author or "").strip() or "unknown"
+        # Validate outside the queue: a missing reason is the caller's mistake,
+        # and must not reach the index or the disk at all.
+        if not node_id:
+            raise ApiError(400, "id is required")
+        if not reason:
+            raise ApiError(400, "reason is required: a tombstone without a reason "
+                                "is an unexplained hole in the record")
+
+        def job(c):
+            row = c.execute("SELECT body FROM nodes WHERE id=?", (node_id,)).fetchone()
+            if not row:
+                raise ApiError(404, f"no such node: {node_id}")
+            old = json.loads(row[0])
+            if old.get("type") == "tombstone":
+                # second purge is a conflict, not a second tombstone: the first
+                # reason is the record, and overwriting it would erase the audit
+                raise ApiError(409, f"already a tombstone: {node_id}")
+
+            tomb = {
+                "id": old["id"], "seq": old.get("seq", 0), "ts": old.get("ts"),
+                "type": "tombstone", "status": "withdrawn",
+                "purged_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+                "reason": reason, "author": author,
+            }
+            assert tuple(tomb) == TOMBSTONE_KEYS  # no field creeps back in
+
+            # file first: it is the truth, as on the write path. Same directory,
+            # so os.replace is atomic — a reader sees the old node or the
+            # tombstone, never half of each.
+            path = self.nodes_dir / f"{old['id']}.json"
+            tmp = path.with_name(path.name + ".purge")
+            fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o644)
+            with os.fdopen(fd, "w") as fh:
+                json.dump(tomb, fh, ensure_ascii=False, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+
+            body = json.dumps(tomb, ensure_ascii=False)
+            c.execute(
+                "UPDATE nodes SET author=?, type=?, s=NULL, p=NULL, o=NULL, "
+                "status=?, topics=?, body=? WHERE id=?",
+                (author, "tombstone", "withdrawn", json.dumps([]), body, old["id"]),
+            )
+            # FTS rows are per-insert, not per-id: the old text lives in its own
+            # row, and UPDATE nodes does not touch it. Delete by nid; a bare
+            # re-insert would leave the secret searchable forever.
+            c.execute("DELETE FROM nodes_fts WHERE nid=?", (old["id"],))
+            self._fts_put(c, tomb)
+            return {"purged": True, "node": tomb}
+
+        r = self._run(job)
+        self._scrub()
+        return r
+
+
+    def _scrub(self) -> None:
+        """Overwrite what the delete left behind. Best effort, after commit.
+
+        SQLite does not zero freed pages (hence `secure_delete`), FTS5 keeps the
+        deleted text in unmerged segments until `optimize`, and the WAL still
+        holds the pre-purge page images until a truncating checkpoint. None of
+        these change what `find` returns — they change what `grep index.db`
+        finds, which for a secret is the whole point.
+        """
+        try:
+            c = self._conn()
+            if getattr(self, "fts_ok", False):
+                c.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('optimize')")
+            c.commit()
+            c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            c.close()
+        except sqlite3.Error:
+            pass
+
+
