@@ -69,7 +69,7 @@ class Derive:
         # existed then and is gone now is exactly the case this is for. One stat
         # per ref is cheap; hashing is left to GET /verify.
         for r in node.get("refs") or []:
-            if r.get("path") and not Path(r["path"]).is_file():
+            if r.get("path") and not self._ref_path(r["path"]).is_file():
                 return "suspect"
             if r.get("node") and not r.get("coral") and r["node"] not in by_id:
                 return "suspect"  # a node ref to an id that is not here cannot be opened
@@ -258,7 +258,7 @@ class Derive:
                 # to be counted as a missing file.
                 m["refs_count"] = len(rs)
                 m["refs_missing"] = sum(1 for r in rs
-                                        if r.get("path") and not Path(r["path"]).is_file())
+                                        if r.get("path") and not self._ref_path(r["path"]).is_file())
             if n.get("type") not in ("review", "tombstone"):
                 # Every proposition can be voted on (§4.2), not only `claim`.
                 # A `question` or `anomaly` that carries a real `sourced` vote

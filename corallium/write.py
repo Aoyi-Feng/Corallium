@@ -131,6 +131,21 @@ class Write:
                                    payload.get("artifact", "")], ensure_ascii=False)
             else:
                 blob = json.dumps([s, p, o, rel, sorted(parents)], ensure_ascii=False)
+            # §20.9: a `supersedes` that keeps s/p/o identical adds a node and no
+            # knowledge — it is how one proposition became three (118→276→315)
+            # every time a file moved. Ref repairs now go through /maintenance/repin.
+            if rel == "supersedes" and parents:
+                for pid in parents:
+                    row = c.execute("SELECT body FROM nodes WHERE id=?", (pid,)).fetchone()
+                    if not row:
+                        continue
+                    old = json.loads(row[0])
+                    if (old.get("s"), old.get("p"), old.get("o")) == (s, p, o):
+                        raise ApiError(409,
+                            "supersedes with an identical s/p/o adds no knowledge: %s already "
+                            "says this. If a referenced file moved, repair it in place with "
+                            "POST /maintenance/repin {\"from\": old, \"to\": new} — one record "
+                            "for the whole batch (PROTOCOL §20.9)" % pid)
             nid = hashlib.sha256(blob.encode()).hexdigest()[:12]
 
             hit = c.execute("SELECT body FROM nodes WHERE id=?", (nid,)).fetchone()

@@ -33,6 +33,17 @@ class Storage:
 
     def __init__(self, root: Path):
         self.root = root
+        # §20.9: refs are stored relative to the repo when they live inside it,
+        # so a coral survives being copied to another machine. `repo:` in
+        # coral.yaml names that root; without it paths stay absolute and this
+        # is exactly what v0.1.25 did.
+        self.repo = None
+        meta = root / "coral.yaml"
+        if meta.exists():
+            for line in meta.read_text().splitlines():
+                if line.strip().startswith("repo:"):
+                    self.repo = Path(line.split(":", 1)[1].strip()).expanduser()
+                    break
         self.nodes_dir = root / "nodes"
         self.nodes_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = root / "index.db"
@@ -44,6 +55,15 @@ class Storage:
         self._ready.wait(10)
         self._rebuild()
         self._load_claims()
+
+
+    def _ref_path(self, p: str) -> Path:
+        """Resolve a stored ref path. Relative means "inside the repo"; `~/`
+        means "inside home"; absolute means what it says."""
+        f = Path(p).expanduser()
+        if f.is_absolute():
+            return f
+        return (self.repo or self.root) / f
 
 
     def _conn(self) -> sqlite3.Connection:
@@ -343,10 +363,24 @@ class Storage:
             if r.get("node"):
                 pinned.append(r)  # node-to-node: the store resolves it, not the filesystem
                 continue
-            f = Path(r["path"]).expanduser()
+            raw = r["path"]
+            f = Path(raw).expanduser()
             if not f.is_absolute():
-                f = self.root / f
-            r["path"] = str(f)
+                f = (self.repo or self.root) / f
+            # Store the shortest stable form: repo-relative inside the repo,
+            # home-relative inside home, absolute otherwise. The hash is of the
+            # bytes, not of the string, so re-pinning does not change identity.
+            if self.repo:
+                try:
+                    r["path"] = str(f.relative_to(self.repo))
+                except ValueError:
+                    pass
+            if r["path"].startswith("/home/") or r["path"].startswith("/Users/"):
+                home = Path.home()
+                try:
+                    r["path"] = "~/" + str(f.relative_to(home))
+                except ValueError:
+                    r["path"] = str(f)
             if f.is_file():
                 r["sha256"] = hashlib.sha256(f.read_bytes()).hexdigest()
                 r["size"] = f.stat().st_size
@@ -378,7 +412,7 @@ class Storage:
                     state = "node" if r.get("coral") or r["node"] in ids else "missing"
                     out.append({"node": n["id"], "i": i, "ref": r, "state": state})
                     continue
-                f = Path(r["path"])
+                f = self._ref_path(r["path"])
                 if not f.is_file():
                     out.append({"node": n["id"], "i": i, "ref": r, "state": "missing"})
                     continue

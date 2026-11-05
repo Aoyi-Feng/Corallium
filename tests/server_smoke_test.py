@@ -181,8 +181,9 @@ def main():
         base = req(a.port, "/nodes", {"s": "T", "p": "base", "o": "1", "author": "a", "topics": ["T"]})[1]["node"]
         mid = req(a.port, "/nodes", {"s": "T", "p": "mid", "o": "2", "author": "a",
                                      "rel": "extends", "parents": [base["id"]], "topics": ["T"]})[1]["node"]
-        req(a.port, "/nodes", {"s": "T", "p": "base", "o": "1", "author": "a", "rel": "supersedes",
-                               "parents": [base["id"]], "status": "withdrawn", "note": "made up"})
+        # v0.1.26: an identical-proposition supersede is refused (§20.9), so the
+        # retraction here is a purge — a tombstone is the other way a parent dies.
+        req(a.port, "/purge", {"id": base["id"], "reason": "test cascade", "author": "a"})
         stb = req(a.port, "/find?q=mid")[1]["hits"][0]["derived_status"]
         ok = stb == "suspect"
         print(f"[8] retraction cascade: child of withdrawn = {stb} -> {'PASS' if ok else 'FAIL'}")
@@ -610,6 +611,62 @@ def main():
         if not ok:
             fails.append(29)
         stop(srv)
+        # 30-33 — §20.9 refs are pointers, not propositions: stored relative to
+        #         the repo, repaired in place by one maintenance record, and no
+        #         longer a reason to republish the same claim.
+        root2 = tempfile.mkdtemp(prefix="coral-repo-")
+        repo = os.path.join(root2, "repo")
+        os.makedirs(os.path.join(repo, "pkg"), exist_ok=True)
+        src = os.path.join(repo, "pkg", "mod.py")
+        open(src, "w").write("X = 1\n")
+        open(os.path.join(root2, "coral.yaml"), "w").write(f"name: repo-test\nrepo: {repo}\n")
+        srv = start(a.server, root2, a.port + 1)
+        n = req(a.port + 1, "/nodes", {"s": "R", "p": "mod_value", "o": "模块里的常数是 1",
+                                       "author": "a", "topics": ["M"], "significance": 2,
+                                       "refs": [{"path": src}]})[1]["node"]
+        stored = (n.get("refs") or [{}])[0].get("path")
+        v0 = req(a.port + 1, f"/verify?node={n['id']}")[1]["refs"][0]["state"]
+        # the file moves; the node must not be republished
+        os.makedirs(os.path.join(repo, "src"), exist_ok=True)
+        os.rename(src, os.path.join(repo, "src", "mod.py"))
+        v1 = req(a.port + 1, f"/verify?node={n['id']}")[1]["refs"][0]["state"]
+        rp = req(a.port + 1, "/maintenance/repin",
+                 {"from": "pkg/mod.py", "to": "src/mod.py", "author": "cur",
+                  "reason": "dir rename"})[1]
+        v2 = req(a.port + 1, f"/verify?node={n['id']}")[1]["refs"][0]["state"]
+        same = req(a.port + 1, f"/reviews?claim={n['id']}")[1]["node"]["id"] == n["id"]
+        # a supersede with an identical proposition is refused
+        code_dup = req(a.port + 1, "/nodes", {"s": "R", "p": "mod_value", "o": "模块里的常数是 1",
+                                              "author": "b", "topics": ["M"],
+                                              "rel": "supersedes", "parents": [n["id"]],
+                                              "force": True, "why_new": "ref moved"})[0]
+        ok = (stored == "pkg/mod.py" and v0 == "ok" and v1 == "missing" and v2 == "ok"
+              and same and rp.get("nodes") == [n["id"]] and rp.get("record") and code_dup == 409)
+        print(f"[30] refs: stored={stored} ok={v0} after_move={v1} after_repin={v2} "
+              f"records={len(rp.get('nodes') or [])}+{1 if rp.get('record') else 0} "
+              f"ref_only_supersede={code_dup} -> {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            fails.append(30)
+        # 31 — a duplicate whose proposition survives elsewhere can be retired
+        #      with reason=duplicate even at high significance.
+        d1 = req(a.port + 1, "/nodes", {"s": "D", "p": "dup_check", "o": "这一句出现了两次，为了测试重复删除",
+                                        "author": "a", "topics": ["M"], "significance": 4,
+                                        "force": True, "why_new": "test a"})[1]["node"]
+        # An identical (s,p,o) can only exist as a second node when rel/parents
+        # differ — the shape every legacy supersede chain has.
+        d2 = req(a.port + 1, "/nodes", {"s": "D", "p": "dup_check", "o": "这一句出现了两次，为了测试重复删除",
+                                        "author": "b", "topics": ["M"], "significance": 4,
+                                        "rel": "extends", "parents": [d1["id"]],
+                                        "force": True, "why_new": "test: same text, different edge"})[1]["node"]
+        code_dup_retire = req(a.port + 1, "/maintenance/retire",
+                              {"id": d1["id"], "reason": "duplicate", "author": "cur"})[0]
+        ok = code_dup_retire == 200
+        print(f"[31] duplicate retire at ★4: {code_dup_retire} -> {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            fails.append(31)
+        stop(srv)
+        srv = None
+        shutil.rmtree(root2, ignore_errors=True)
     finally:
         if srv is not None:
             stop(srv)

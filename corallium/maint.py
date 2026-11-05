@@ -101,8 +101,12 @@ class Maint:
                   if table[n["id"]]["derived_status"] != "withdrawn"
                   and n["id"] not in settled
                   for r in (n.get("refs") or [])
-                  if r.get("path") and not Path(r["path"]).is_file()]
-        junk = []
+                  if r.get("path") and not self._ref_path(r["path"]).is_file()]
+        # Not "junk": the four tests below (no children, no votes, low
+        # significance, no refs) measure *unused*, not *worthless*. The name
+        # was teaching curators to delete unanswered questions and buried
+        # findings — §20.8 now refuses most of those retires anyway.
+        unreferenced = []
         for n in live:
             if n.get("type") == "decision":
                 continue
@@ -112,7 +116,7 @@ class Maint:
                          and x.get("claim") == n["id"]
                          and (x.get("kind") or x.get("p")) == "junk"
                          and x.get("author") != n.get("author"))
-                junk.append({"id": n["id"], "o": n.get("o", "")[:60],
+                unreferenced.append({"id": n["id"], "o": n.get("o", "")[:60],
                              "why": "no children, no votes, ★%s" % n.get("significance", 3),
                              "author": n.get("author"), "junk_votes": jv,
                              "retirable": bool(jv)})
@@ -143,7 +147,7 @@ class Maint:
                 and table[n["id"]]["derived_status"] != "withdrawn"
                 and children.get(n["id"], 0) == 0]
         return {"duplicates": dups[:50], "orphans": [n["id"] for n in roots][:100],
-                "broken_refs": broken, "junk": junk[:50], "admin": admin[:50],
+                "broken_refs": broken, "unreferenced": unreferenced[:50], "admin": admin[:50],
                 "suggestions": sugg[:50],
                 "counts": {"nodes": len(alln), "roots": len(roots),
                            "roots_linked": len(roots_linked),
@@ -158,7 +162,8 @@ class Maint:
                            "admin_ratio": round(len(admin) / max(len(alln), 1), 3),
                            "suggestions": len(sugg),
                            "suggestions_stale": sum(1 for s in sugg if s["age_seq"] > 20),
-                           "duplicate_pairs": len(dups), "junk": len(junk)}}
+                           "duplicate_pairs": len(dups),
+                           "unreferenced": len(unreferenced)}}
 
 
 
@@ -204,40 +209,42 @@ class Maint:
                  and x.get("claim") == node_id
                  and (x.get("kind") or x.get("p")) != "junk"]
         fails = []
-        if children:
-            fails.append(f"has {len(children)} child node(s): {children[:3]}")
-        if votes:
-            fails.append(f"has {len(votes)} vote(s): {votes[:3]}")
-        if int(n.get("significance", 3)) > 2 and reason.strip().lower() != "admin":
-            fails.append(f"significance is {n.get('significance')} (retire allows <=2)")
-        # §20.6: an administrative node's refs point at the change it records,
-        # not at evidence for a proposition — so for `reason=admin` the
-        # evidence-backed defence does not apply. The other three gates do.
-        if n.get("refs") and reason.strip().lower() != "admin":
-            fails.append("has file references: it is evidence-backed, not junk")
-        junk_votes = [x["id"] for x in alln if x.get("type") == "review"
-                      and x.get("claim") == node_id
-                      and (x.get("kind") or x.get("p")) == "junk"
-                      and x.get("author") != n.get("author")]
-        if not junk_votes:
-            # Structural gates say "nobody would miss it"; they cannot say
-            # "it is wrong". That claim has to be made by someone, on the
-            # record, before anything is destroyed.
-            fails.append("no `junk` vote: nothing has accused this node of being a mistake")
-        # §20.8: maintenance may remove nodes, never knowledge. A retire is
-        # lossless only if the proposition still exists somewhere — either as an
-        # exact (s,p,o) twin or at >=0.90 similarity. Otherwise the right verb is
-        # `merge` (one node stands for both) or `supersedes` (the new node carries
-        # the proposition forward), both of which keep the text in the graph.
-        if reason.strip().lower() != "admin":
-            twin = any(x["id"] != node_id and x.get("type") != "tombstone"
-                       and (x.get("s"), x.get("p"), x.get("o"))
-                       == (n.get("s"), n.get("p"), n.get("o")) for x in alln)
-            near = [c for c in self._candidates(n.get("p", ""), n.get("o", ""), limit=8)
-                    if c["id"] != node_id and c["similarity"] >= 0.90]
-            if not twin and not near:
-                fails.append("this is the only copy of the proposition: retire would lose "
-                             "knowledge — use merge or supersedes, or reason=admin if it is a record")
+        mode = reason.strip().lower()
+        twins = [x["id"] for x in alln
+                 if x["id"] != node_id and x.get("type") != "tombstone"
+                 and (x.get("s"), x.get("p"), x.get("o"))
+                 == (n.get("s"), n.get("p"), n.get("o"))]
+        if mode == "duplicate":
+            # The copy is the proof. §20.8 asks one question — does the
+            # proposition survive? — and an identical (s,p,o) answers it. A
+            # tombstone keeps the id, so a child that pointed here does not
+            # dangle, and the chain's newest copy still carries the text. The
+            # other gates protect knowledge, and there is no knowledge here
+            # that exists only once.
+            if not twins:
+                fails.append("reason=duplicate needs an identical s/p/o copy; none exists, "
+                             "so this is the only copy of the proposition")
+        else:
+            if children:
+                fails.append(f"has {len(children)} child node(s): {children[:3]}")
+            if votes:
+                fails.append(f"has {len(votes)} vote(s): {votes[:3]}")
+            if int(n.get("significance", 3)) > 2 and mode != "admin":
+                fails.append(f"significance is {n.get('significance')} (retire allows <=2)")
+            if n.get("refs") and mode != "admin":
+                fails.append("has file references: it is evidence-backed, not junk")
+            junk_votes = [x["id"] for x in alln if x.get("type") == "review"
+                          and x.get("claim") == node_id
+                          and (x.get("kind") or x.get("p")) == "junk"
+                          and x.get("author") != n.get("author")]
+            if not junk_votes:
+                fails.append("no `junk` vote: nothing has accused this node of being a mistake")
+            if mode != "admin":
+                near = [c for c in self._candidates(n.get("p", ""), n.get("o", ""), limit=8)
+                        if c["id"] != node_id and c["similarity"] >= 0.90]
+                if not twins and not near:
+                    fails.append("this is the only copy of the proposition: retire would lose "
+                                 "knowledge — use merge or supersedes, or reason=admin if it is a record")
         if fails:
             raise ApiError(409, "refusing to retire: " + "; ".join(fails))
         # Applying a proposal closes it: the record's parents are the applied
@@ -256,6 +263,82 @@ class Maint:
                                   "why_new": "closure of suggestion " + suggestion})
             del once
         return self.purge(node_id, reason, author)
+
+
+    def repin(self, old: str, new: str, author: str, reason: str = "",
+              nodes: list | None = None) -> dict:
+        """§20.9: move a reference in place, without copying the node.
+
+        Nodes are immutable except for refs: a path is a pointer, not a
+        proposition. Before this, the only way to fix a moved file was to
+        publish the same claim again with `supersedes` — which is why one
+        proposition ended up as 118→276→315 and why 72 nodes became `replaced`
+        after a single rename. This rewrites the ref (path + sha256 + size) in
+        the same file, same id, same seq, and leaves one decision as the record.
+        """
+        old = (old or "").strip()
+        new = (new or "").strip()
+        if not old or not new:
+            raise ValueError("repin needs both `from` and `to`")
+        if old == new:
+            raise ValueError("from and to are the same path")
+        want = set(nodes or [])
+
+        def job(c):
+            rows = c.execute("SELECT id, body FROM nodes").fetchall()
+            touched, skipped = [], 0
+            for nid, body in rows:
+                if want and nid not in want:
+                    continue
+                n = json.loads(body)
+                if n.get("type") == "tombstone":
+                    continue
+                changed = False
+                for r in (n.get("refs") or []):
+                    pth = r.get("path") or ""
+                    if not pth:
+                        continue
+                    if pth == old or pth.startswith(old.rstrip("/") + "/"):
+                        r["path"] = new + pth[len(old):]
+                        f = self._ref_path(r["path"])
+                        if f.is_file():
+                            r["sha256"] = hashlib.sha256(f.read_bytes()).hexdigest()
+                            r["size"] = f.stat().st_size
+                            r["missing"] = False
+                        else:
+                            r["missing"] = True
+                            r.pop("sha256", None)
+                        changed = True
+                if not changed:
+                    continue
+                path = self.nodes_dir / f"{nid}.json"
+                tmp = path.with_name(path.name + ".repin")
+                fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o644)
+                with os.fdopen(fd, "w") as fh:
+                    json.dump(n, fh, ensure_ascii=False, indent=2)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp, path)
+                c.execute("UPDATE nodes SET body=? WHERE id=?",
+                          (json.dumps(n, ensure_ascii=False), nid))
+                touched.append(nid)
+            return touched
+
+        # The record is written *after* the job, not inside it: add_node enqueues
+        # its own write, and a job that waits on the queue it is running on
+        # deadlocks the single writer until the timeout (measured, §20.4).
+        touched = self._run(job)
+        if not touched:
+            return {"from": old, "to": new, "nodes": [], "created": False}
+        rec = self.add_node({
+            "s": old, "p": "maintenance:repin",
+            "o": "%s -> %s (%d node(s))" % (old, new, len(touched)),
+            "author": author, "type": "decision", "topics": ["maintenance"],
+            "significance": 2, "force": True,
+            "why_new": "one record for a batch ref repair, instead of %d supersede copies" % len(touched),
+            "note": (reason or "") + " | nodes: " + ", ".join(touched[:40]),
+        })
+        return {"from": old, "to": new, "nodes": touched, "record": rec["node"]["id"]}
 
 
     def purge(self, node_id: str, reason: str, author: str) -> dict:

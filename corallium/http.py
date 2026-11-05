@@ -178,6 +178,12 @@ def make_handler(corals: dict, read_token: str, write_token: str, default: str |
                                                        payload.get("reason", ""),
                                                        payload.get("author", "curator"),
                                                        payload.get("suggestion", "")))
+                if ep == "/maintenance/repin":
+                    return self._send(200, store.repin(payload.get("from", ""),
+                                                       payload.get("to", ""),
+                                                       payload.get("author", "curator"),
+                                                       payload.get("reason", ""),
+                                                       payload.get("nodes") or None))
                 if ep == "/maintenance/retire":
                     return self._send(200, store.retire(payload.get("id", ""),
                                                         payload.get("reason", ""),
