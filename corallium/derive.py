@@ -78,18 +78,26 @@ class Derive:
 
         # retraction cascades transitively: a node whose support was withdrawn
         # is `suspect`, however deep the withdrawal sits above it.
-        stack, seen = list(node.get("parents") or []), set()
-        while stack:
-            pid = stack.pop()
-            if pid in seen:
-                continue
-            seen.add(pid)
-            parent = by_id.get(pid)
-            if not parent:
-                continue
-            if pid in dead:
-                return "suspect"
-            stack.extend(parent.get("parents") or [])
+        #
+        # Except through a `supersedes` edge: that edge is a replacement, not
+        # support. Without this, the record of retiring a node inherits the
+        # node's death and becomes `suspect` for having done its job — and every
+        # child of that record inherits it in turn.
+        if node.get("rel") != "supersedes":
+            stack, seen = list(node.get("parents") or []), set()
+            while stack:
+                pid = stack.pop()
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                parent = by_id.get(pid)
+                if not parent:
+                    continue
+                if pid in dead:
+                    return "suspect"
+                if parent.get("rel") == "supersedes":
+                    continue  # do not walk through a replacement record
+                stack.extend(parent.get("parents") or [])
 
         votes = [n for n in all_nodes if n.get("type") == "review"
                  and n.get("claim") == node["id"]
