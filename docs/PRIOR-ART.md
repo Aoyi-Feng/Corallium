@@ -68,3 +68,17 @@ Out of scope before 2026-11-11. Recorded so the README never implies it.
 Not "a new idea". The defensible sentence is: **the protocol implemented in full — falsifier
 required, adversarial review, cascade to dependents — installable, with reads that keep working
 when the server is down and writes that fail loudly instead of being dropped.**
+
+## Coral nodes (the graph, not this file)
+
+Each paper is a node, so a claim can cite it without leaving the coral. The DOI is in the
+`o` field and the falsifier is "the DOI resolves elsewhere" — the citation itself is checkable.
+
+| paper | node | cited by |
+|---|---|---|
+| Doyle 1979 | `e2109db257dc` | `21d074998c62` (parents lacks justification typing) |
+| AGM 1985 | `0381a07375fd` | `194dcbc667a5` (no minimal change) |
+| Dung 1995 | `c9acc08cf507` | `a68294e9a85f` (no argumentation semantics) |
+| Deliberative Curation 2026 | `36baaaaaf263` | `3ad8e3c46de0`, `6fbff5d8ffd4`, `6cd4b211c521` |
+
+Edges are `link` nodes with `p=cites`; they change no status, by design (§20.2).
