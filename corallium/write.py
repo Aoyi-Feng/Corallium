@@ -18,6 +18,18 @@ from pathlib import Path
 from queue import Queue
 
 
+def _trigrams(text: str) -> set[str]:
+    t = re.sub(r"\s+", " ", (text or "").strip().lower())
+    return {t[i:i + 3] for i in range(max(0, len(t) - 2))} or ({t} if t else set())
+
+
+def _trigram_jaccard(a: str, b: str) -> float:
+    A, B = _trigrams(a), _trigrams(b)
+    if not A or not B:
+        return 0.0
+    return len(A & B) / len(A | B)
+
+
 class Write:
     """Publishing propositions and casting votes."""
 
@@ -99,6 +111,32 @@ class Write:
             rel = payload.get("rel", "root")
             parents = payload.get("parents") or []
             ntype = payload.get("type", "claim")
+            # §3.2 — a claim must say what would make it wrong. Without that the
+            # node is unfalsifiable by construction: a later reader cannot tell
+            # whether it was ever tested, and `tip` cannot separate a guess from
+            # a finding. The check is mechanical on purpose (length + not a
+            # paraphrase of the claim) because judging whether a falsifier is
+            # *good* is not a thing a write path can honestly do.
+            if ntype == "claim":
+                fals = (payload.get("falsifier") or "").strip()
+                if not fals:
+                    raise ApiError(400, "type=claim requires falsifier: one sentence naming an "
+                                        "observation that would make this false (PROTOCOL §3.2). "
+                                        "If nothing could, it is not a claim.")
+                if len(fals) < 15:
+                    raise ApiError(400, f"falsifier too short ({len(fals)} chars): name what would be "
+                                        "observed, not that it might be wrong")
+                # "restates the claim" must catch the common cheat — copy the claim
+                # and append "of the time" — so compare containment first, then
+                # trigram overlap. Jaccard alone passes those (0.85), containment
+                # does not.
+                norm = lambda t: re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", t.lower())
+                n_o = norm(o)
+                # containment only makes sense for a claim long enough to be
+                # quoted: for `o="x"` every sentence containing an x matches.
+                if (len(n_o) >= 12 and n_o[:24] in norm(fals)) or _trigram_jaccard(fals, f"{s} {o}") >= 0.85:
+                    raise ApiError(400, "falsifier restates the claim; it must name a different "
+                                        "observation, otherwise it can never fail")
             # A parent id that resolves to nothing is not a weaker edge, it is no
             # edge at all: the child silently becomes a root, never cascades when
             # its support is retracted, and — because the write gate is skipped
@@ -199,6 +237,10 @@ class Write:
                 "significance": max(1, min(5, int(payload.get("significance", 3) or 3))),
                 "note": payload.get("note", ""),
             }
+            # stored only where it is required: legacy nodes carry no falsifier,
+            # and their absence means "written before v0.1.29", not "unfalsifiable"
+            if ntype == "claim":
+                node["falsifier"] = fals
             if payload.get("method"):
                 node["method"] = payload["method"]
             # review nodes must carry what they are evidence *for*, and the

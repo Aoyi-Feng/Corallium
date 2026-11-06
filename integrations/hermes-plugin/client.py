@@ -405,7 +405,8 @@ def publish(s: str, p: str, o: str, *, coral: str = "", rel: str = "root",
             refs: list | None = None, artifacts: dict | None = None,
             force: bool = False, why_new: str = "",
             attempts: int | None = None, volatility: str = "",
-            action: str = "", targets: list | None = None) -> str:
+            action: str = "", targets: list | None = None,
+            falsifier: str = "") -> str:
     coral = pick_coral(coral)
     if force and not (why_new or "").strip():
         return ("PUBLISH FAILED: force needs why_new — say how this differs from the node it "
@@ -431,6 +432,10 @@ def publish(s: str, p: str, o: str, *, coral: str = "", rel: str = "root",
         payload["volatility"] = volatility
     if method:
         payload["method"] = method
+    # §3.2: what observation would make this false. Required by the server for
+    # type=claim; the client forwards it and lets the 400 explain the rule.
+    if falsifier:
+        payload["falsifier"] = falsifier
     if refs:
         payload["refs"] = refs
     if artifacts:

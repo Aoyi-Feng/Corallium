@@ -58,7 +58,19 @@ def stop(p):
         p.kill()
 
 
+def _with_falsifier(path, payload):
+    """v0.1.29 requires a falsifier on type=claim. These tests are about other
+    behaviour, so they get a default one; the gate itself is exercised in
+    test_falsifier.py."""
+    if isinstance(payload, dict) and str(path).endswith("/nodes"):
+        if payload.get("type", "claim") == "claim" and "falsifier" not in payload:
+            payload = dict(payload)
+            payload["falsifier"] = "an observation that contradicts the test fixture body"
+    return payload
+
+
 def req(port, path, payload=None):
+    payload = _with_falsifier(path, payload)
     data = json.dumps(payload).encode() if payload is not None else None
     r = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data,
                                method="POST" if data else "GET",

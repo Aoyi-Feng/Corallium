@@ -85,7 +85,12 @@ PUBLISH_SCHEMA = _schema(
                                  "Reported as `tried N`; >5 needs an adversarial vote to reach confirmed. "
                                  "Omit only if it really was the first attempt"},
      "volatility": {"type": "string", "enum": ["static", "slow", "fast", "live"],
-                    "description": "How fast this fact expires: static (never) / slow (180d) / fast (1d) / live (1h)"}},
+                    "description": "How fast this fact expires: static (never) / slow (180d) / fast (1d) / live (1h)"},
+     "falsifier": {**_STR,
+                   "description": "REQUIRED for type=claim: one sentence naming an observation that would "
+                                  "make this false. The server refuses a claim without it, and refuses one "
+                                  "that merely restates the claim. If nothing could falsify it, it is not a "
+                                  "claim — publish it as a decision or a note on a task instead"}},
     ("s", "p", "o"))
 
 SUGGEST_SCHEMA = _schema(
@@ -197,7 +202,8 @@ def _h_publish(args, **kw):
         why_new=str(args.get("why_new") or ""),
         attempts=(int(args["attempts"]) if args.get("attempts") is not None else None),
         volatility=str(args.get("volatility") or ""),
-        action=str(args.get("action") or ""), targets=args.get("targets") or [])
+        action=str(args.get("action") or ""), targets=args.get("targets") or [],
+        falsifier=str(args.get("falsifier") or ""))
 
 
 def _h_suggest(args, **kw):

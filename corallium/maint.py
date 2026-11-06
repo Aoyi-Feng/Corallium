@@ -163,7 +163,14 @@ class Maint:
                            "suggestions": len(sugg),
                            "suggestions_stale": sum(1 for s in sugg if s["age_seq"] > 20),
                            "duplicate_pairs": len(dups),
-                           "unreferenced": len(unreferenced)}}
+                           "unreferenced": len(unreferenced),
+                           # v0.1.29 made the falsifier a write condition; the
+                           # 100+ claims written before it still carry none. Count
+                           # them so the gap is visible instead of assumed shut.
+                           "claims_no_falsifier": sum(
+                               1 for n in alln
+                               if n.get("type") == "claim" and not n.get("falsifier")
+                               and n.get("status") != "withdrawn")}}
 
 
 

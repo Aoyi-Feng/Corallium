@@ -1,4 +1,4 @@
-# Corallium Protocol v0.1.28
+# Corallium Protocol v0.1.29
 
 > 名字来自珊瑚：新珊瑚虫长在旧骨骼上，一层层叠，分支形态本身就是历史。
 
@@ -71,6 +71,8 @@ agent 靠这一行决定查哪儿。
 
 判断标准：能不能设想一个实验或一个来源，它会让这条命题变假？
 不能的话，它不是命题，是感想，不该进来。
+
+**v0.1.29 起这条不是建议，是写入条件。** `type=claim` 必须带 `falsifier`：一句说明"观察到什么就说明它对"，≥15 字符，且不能是命题本身的复述（归一化包含或字符三元组 Jaccard ≥0.85 即拒）。缺了 → 400。判断"证伪条件写得好不好"交给读者，服务端只保证"存在且不是同义反复"。
 
 反例（不合格）：
 - "MQSim 有些地方不准" ← 无法证伪
@@ -1308,6 +1310,7 @@ grep -c '<明文>' <root>/index.db*      # 必须全是 0
 
 ## 变更记录
 
+- **v0.1.29** — §2.1 的证伪条件成为写入校验：`type=claim` 缺 `falsifier` → 400；<15 字符 → 400；把命题复述一遍（归一化包含或三元组 Jaccard ≥0.85）→ 400。插件 `coral_publish` 增加 `falsifier` 参数。存量 103 条 claim 不追溯，缺字段表示"写于 v0.1.29 之前"。
 - **v0.1.28** — §20.10 维护是串行的：新增 `POST /maintenance/lease {author, ttl}` / `POST /maintenance/release` / `GET /maintenance/lease`；`merge`/`retire`/`repin` 必须由租约持有者发起，否则 409。建议节点不受限制——提案可以并行，执行只能一个人。插件的 `coral_suggest` 是唯一的维护形工具，`coral_publish` 不再接受 `type=suggestion`。
 - **v0.1.27** — 建议节点真的被存下来了：`add_node` 之前对 `type=suggestion` 的 `action`/`targets` 直接丢弃（插件一直在发，服务端一直扔，`scan` 里每条建议都是 `action: null`）。现在写入时校验并落盘：`action` 必须是 merge/retire/link/split/reindex 之一，`targets` 必须非空且都存在，否则 400——与 `parents` 同一条理由：打错字必须当场失败，而不是永久落盘。
 - **v0.1.26** — §20.9 引用是指针，不是命题：`refs` 在仓库内的路径改为相对存储（仓库根写在 `coral.yaml` 的 `repo:`，家目录内的写 `~/…`），验证时按同一规则解析；新增 `POST /maintenance/repin {from,to}` 原地改写一批节点的 refs（同 id、同 seq、重算 sha256），并发一条 decision 作为唯一记录；`rel=supersedes` 在 `s/p/o` 与父节点完全相同时返回 409。这是 118→276→315 那条三胞胎链的成因：文件名一改，唯一合法的修法是重发同一条命题。现在改路径只用一次维护动作，改完不会多一个节点。`retire` 新增 `reason=duplicate`：命题在别处存在时，即使 significance 高也允许删除（唯一副本仍然拒绝）。
