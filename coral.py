@@ -43,7 +43,8 @@ CONFIG_PATH = Path(os.environ.get("CORALLIUM_CONFIG", "~/.hermes/config.yaml")).
 WEIGHTS = {"adversarial": 4, "replicated": 3, "sourced": 2, "derived": 1,
            "agree": 0, "refuted": -3, "redundant": -2, "junk": 0}
 RELS = ("root", "extends", "supersedes", "merges")
-TYPES = ("claim", "anomaly", "question", "decision", "task")
+TYPES = ("claim", "anomaly", "question", "decision", "task",
+         "prior-art", "postmortem", "spec", "link")
 READ_TIMEOUT = 3.0   # local reads are sub-ms; fail fast if the server is gone
 WRITE_TIMEOUT = 15.0  # the writer queue may serialise a burst of publishes
 
@@ -723,6 +724,11 @@ def cmd_add(a) -> int:
     if a.force:
         body["force"] = True
         body["why_new"] = a.why_new
+    # §3.2: since v0.1.29 a claim without a falsifier is a 400, so the CLI has to
+    # be able to send one — otherwise `coral add` could not publish the default
+    # type at all.
+    if (a.falsifier or "").strip():
+        body["falsifier"] = a.falsifier.strip()
     method = parse_method(a.method)
     if method:
         body["method"] = method
@@ -878,6 +884,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--method", default="", help="JSON object or k=v,k=v (config, cmd, version, seed)")
     s.add_argument("--ref", action="append", default=[], metavar="PATH",
                    help="file the server hashes at write time (repeatable)")
+    s.add_argument("--falsifier", default="",
+                   help="REQUIRED for type=claim: the observation that would make this false")
     s.add_argument("--attempts", type=int, default=1)
     s.add_argument("--volatility", default="static",
                    choices=["static", "slow", "fast", "live"])

@@ -178,7 +178,12 @@ class Storage:
 
     @staticmethod
     def _fts_text(n: dict) -> str:
-        parts = [str(n.get(k) or "") for k in ("s", "p", "o", "note", "type", "author")]
+        # `falsifier` and `method` are part of what a node says: without them,
+        # `find` cannot answer "who already tried this test" or "which claims
+        # name this observation", and the falsifier became unsearchable the
+        # moment it was stored outside the id.
+        parts = [str(n.get(k) or "") for k in
+                 ("s", "p", "o", "note", "type", "author", "falsifier", "method")]
         parts += [str(t) for t in (n.get("topics") or [])]
         return " ".join(p for p in parts if p)
 

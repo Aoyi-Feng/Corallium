@@ -167,10 +167,13 @@ class Maint:
                            # v0.1.29 made the falsifier a write condition; the
                            # 100+ claims written before it still carry none. Count
                            # them so the gap is visible instead of assumed shut.
+                           # Counting on the stored status was counting on a field
+                           # that is never written: superseded claims stayed in the
+                           # number forever, so the metric could not reach 0.
                            "claims_no_falsifier": sum(
                                1 for n in alln
                                if n.get("type") == "claim" and not n.get("falsifier")
-                               and n.get("status") != "withdrawn")}}
+                               and table[n["id"]]["derived_status"] != "withdrawn")}}
 
 
 

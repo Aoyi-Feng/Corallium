@@ -139,12 +139,32 @@ def make_handler(corals: dict, read_token: str, write_token: str, default: str |
                     r = store.reviews(q.get("claim", [""])[0])
                     return self._send(404 if "error" in r else 200, r)
                 if ep == "/find":
-                    hits, outside = store.find(q.get("q", [""])[0],
+                    # v0.1.33: the page size used to be whatever `find()` defaulted
+                    # to (5); ?limit= and ?n= were parsed by nobody, so a caller
+                    # asking for 50 silently got 5 and the conflicts check only
+                    # ever compared those five.
+                    try:
+                        lim = int((q.get("limit") or q.get("n") or ["5"])[0])
+                    except (TypeError, ValueError):
+                        lim = 5
+                    lim = max(1, min(50, lim))
+                    hits, outside = store.find(q.get("q", [""])[0], limit=lim,
                                                root=(q.get("root", [""])[0] or ""),
-                                               order=(q.get("sort", ["recent"])[0] or "recent"))
+                                               order=(q.get("sort", [""])[0] or "recent"))
+                    # Status is derived, never stored. Serving the stored field
+                    # made every superseded node look `open` in search results
+                    # while `tip` correctly called it withdrawn.
+                    alln = store._all()
+                    by_id = {n["id"]: n for n in alln}
+                    dead, replaced = store._dead_sets(alln)
+                    for h in hits:
+                        h["status"] = store.derive_status(h, alln, by_id, dead, replaced)
                     from .store import conflicts as _conflicts
+                    # A "disagreement" between a live node and a withdrawn one is
+                    # not a disagreement: the corpus has a verdict already.
+                    live = [h for h in hits if h.get("status") != "withdrawn"]
                     return self._send(200, {"hits": hits, "outside": outside,
-                                            "conflicts": _conflicts(hits)})
+                                            "conflicts": _conflicts(live)})
                 return self._send(404, {"error": "not found"})
             except ValueError as e:  # ?cursor=abc is the caller's fault, not a crash
                 return self._send(400, {"error": str(e)})

@@ -250,6 +250,15 @@ class Derive:
                       if v.get("type") == "review"
                       and (v.get("kind") or v.get("p")) == "adversarial"
                       and v.get("author") != (by_id.get(v.get("claim")) or {}).get("author")}
+        # §4.1: "unreviewed" must mean *nobody else* looked. Counting raw votes
+        # let a claim clear the flag by voting for itself — one author, one vote,
+        # and the read path called it checked.
+        indep: dict[str, set] = {}
+        for v in alln:
+            if v.get("type") == "review" and v.get("claim"):
+                tgt = by_id.get(v["claim"])
+                if tgt is not None and v.get("author") != tgt.get("author"):
+                    indep.setdefault(v["claim"], set()).add(v.get("author"))
         table: dict[str, dict] = {}
         for n in alln:
             m = dict(n)
@@ -281,7 +290,7 @@ class Derive:
                 # infer that from `votes: 0` buried in the payload, so an `open`
                 # claim with no review read exactly like one that had survived a
                 # replication. Say it in the line.
-                m["unreviewed"] = sc["votes"] == 0
+                m["unreviewed"] = not indep.get(n["id"])
                 m["significance"] = n.get("significance", 3)
                 m["dependents"] = deps.get(n["id"], 0)
             table[n["id"]] = m
@@ -319,7 +328,12 @@ class Derive:
         # `tip` would answer "what do we believe now" with a list of pointers.
         # §20.7: a `suggestion` is a proposal about the shape, not a belief:
         # it must not answer "what do we believe now" either.
-        scope = [n for n in scope if n.get("type") not in ("link", "suggestion")]
+        # §20.2/§20.7: a link is structure and a suggestion is a proposal about
+        # shape. v0.1.33 adds the two that are not conclusions either: a review is
+        # evidence *about* a claim, and a task is an obligation. `tip` answered
+        # "what do we believe" with 46 votes and 16 tasks in a 223-item list.
+        scope = [n for n in scope
+                 if n.get("type") not in ("link", "suggestion", "review", "task", "tombstone")]
         ids = {n["id"] for n in scope}
         child_of = {p for n in scope for p in (n.get("parents") or []) if p in ids}
         tips = [n for n in scope if n["id"] not in child_of]

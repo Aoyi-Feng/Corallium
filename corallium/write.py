@@ -6,6 +6,7 @@ an unknown parent id, and a vote with no target.
 """
 
 from .errors import ApiError
+from .types import normalize as normalize_type
 import hashlib
 import json
 import os
@@ -108,9 +109,18 @@ class Write:
             s, p, o = payload.get("s"), payload.get("p"), payload.get("o")
             if not (s and p and o):
                 raise ValueError("s, p, o are required")
+            # An anonymous write fixed the node's id to a shared identity: claim
+            # ids exclude the author, so the first `unknown` write owned that id
+            # and every later author's vote on it counted as a self-vote.
+            if not str(payload.get("author") or "").strip():
+                raise ApiError(400, "author is required: an anonymous node cannot be "
+                                    "distinguished from a self-review (PROTOCOL §4.1)")
             rel = payload.get("rel", "root")
             parents = payload.get("parents") or []
-            ntype = payload.get("type", "claim")
+            try:
+                ntype = normalize_type(payload.get("type", "claim"))
+            except ValueError as e:
+                raise ApiError(400, str(e))
             # §3.2 — a claim must say what would make it wrong. Without that the
             # node is unfalsifiable by construction: a later reader cannot tell
             # whether it was ever tested, and `tip` cannot separate a guess from
@@ -226,7 +236,7 @@ class Write:
                 "id": nid, "seq": seq,
                 "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
                 "author": payload.get("author", "unknown"),
-                "type": payload.get("type", "claim"),
+                "type": ntype,
                 "s": s, "p": p, "o": o, "rel": rel, "parents": parents,
                 "status": payload.get("status", "open"),
                 "volatility": payload.get("volatility", "static"),
@@ -243,6 +253,15 @@ class Write:
                 node["falsifier"] = fals
             if payload.get("method"):
                 node["method"] = payload["method"]
+            # A vote inherits the topics of what it votes on. Without this,
+            # `since?topics=protocol` returned 0 reviews while 24 votes targeted
+            # protocol-tagged claims: a follower of a topic never learned that
+            # its claims had been replicated or refuted.
+            if ntype == "review" and not node["topics"] and payload.get("claim"):
+                row = c.execute("SELECT body FROM nodes WHERE id = ?",
+                                (payload["claim"],)).fetchone()
+                if row:
+                    node["topics"] = json.loads(row[0]).get("topics") or []
             # review nodes must carry what they are evidence *for*, and the
             # prior node that proves the reviewer had not seen the conclusion.
             for k in ("claim", "prior", "kind", "artifact"):
