@@ -308,6 +308,10 @@ def _line(n: dict) -> str:
     if int(n.get("attempts") or 1) > 1:
         # §4.6: "the best of twenty" must not read as "the only one".
         bits.append("tried %d" % int(n["attempts"]))
+    # A reader has no other way to tell "nobody looked" from "somebody checked
+    # and found nothing wrong" — both render as `open`. Say which.
+    if n.get("unreviewed"):
+        bits.append("UNREVIEWED")
     return head + ("  — " + "; ".join(bits) if bits else "")
 
 
@@ -342,6 +346,16 @@ def find(q: str, coral: str = "", limit: int = 5, sort: str = "recent") -> str:
         body = "\n".join(_line(h) for h in hits) if hits else "(no hits)"
         if outside:
             body += "\n(%d more matched outside the scope you asked for)" % outside
+        conf = r.get("conflicts") or []
+        if conf:
+            # Two hits that describe the same thing and disagree are not two
+            # pieces of evidence; they are a question nobody has settled. Show
+            # the pair, because the reader is the only one who can.
+            body += "\n\nCONFLICT — same subject, different answer, no verdict yet:"
+            for c in conf[:5]:
+                body += ("\n  %s says %r\n  %s says %r\n  similarity %.2f"
+                         % (c["a"], c["a_says"], c["b"], c["b_says"], c["similarity"]))
+            body += "\n  -> settle it: coral_vote(adversarial) with the artifact that decides, or publish the tie-break"
         return "%s\n%s" % (coral, body)
     except Exception:
         hits = _offline_find(coral, q, limit)

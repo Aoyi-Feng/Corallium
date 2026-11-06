@@ -28,6 +28,49 @@ from .maint import Maint
 from .write import Write
 
 
+def _tri(text: str) -> set:
+    t = " ".join((text or "").lower().split())
+    return {t[i:i + 3] for i in range(max(0, len(t) - 2))} or ({t} if t else set())
+
+
+def _jac(a: str, b: str) -> float:
+    A, B = _tri(a), _tri(b)
+    if not A or not B:
+        return 0.0
+    return len(A & B) / len(A | B)
+
+
+def conflicts(hits: list[dict], thr: float = 0.62) -> list[dict]:
+    """Pairs in a result set that talk about the same thing but not the same way.
+
+    The write gate stops a near-duplicate at 0.62; it cannot stop two nodes that
+    are near-duplicates of each other and disagree, because each was written
+    alone. `12 ms` and `120 ms` are 0.95 similar and cannot both be true, so the
+    reader is the only place this can be caught — and if it is not shown, the
+    second hit simply looks like corroboration.
+    """
+    out = []
+    for i in range(len(hits)):
+        for j in range(i + 1, len(hits)):
+            a, b = hits[i], hits[j]
+            if a.get("type") in ("link", "review", "suggestion"):
+                continue
+            if b.get("type") in ("link", "review", "suggestion"):
+                continue
+            sa = f"{a.get('s','')} {a.get('p','')} {a.get('o','')}"
+            sb = f"{b.get('s','')} {b.get('p','')} {b.get('o','')}"
+            sim = _jac(sa, sb)
+            if sim < thr:
+                continue
+            same_o = " ".join(str(a.get("o", "")).lower().split()) == \
+                     " ".join(str(b.get("o", "")).lower().split())
+            if same_o:
+                continue  # restatement, not a disagreement
+            out.append({"a": a.get("id"), "b": b.get("id"), "similarity": round(sim, 3),
+                        "a_says": str(a.get("o", ""))[:120], "b_says": str(b.get("o", ""))[:120]})
+    return out
+
+
 class Storage:
     """Single writer: every mutation goes through one queue and one thread."""
 

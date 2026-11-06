@@ -1,4 +1,4 @@
-# Corallium Protocol v0.1.29
+# Corallium Protocol v0.1.30
 
 > 名字来自珊瑚：新珊瑚虫长在旧骨骼上，一层层叠，分支形态本身就是历史。
 
@@ -1310,6 +1310,7 @@ grep -c '<明文>' <root>/index.db*      # 必须全是 0
 
 ## 变更记录
 
+- **v0.1.30** — 读路径带义务：`/tip` 与 `/find` 的每条结果带 `unreviewed`（该节点没有任何票），客户端渲染为 `UNREVIEWED`；`/find` 额外返回 `conflicts`——同一结果集内相似度 ≥0.62 但 `o` 不同的成对节点，客户端以 `CONFLICT` 块列出并给出裁决动作。写入端拦不住两条各自单独写下的冲突命题，所以这道检查只能放在读端。
 - **v0.1.29** — §2.1 的证伪条件成为写入校验：`type=claim` 缺 `falsifier` → 400；<15 字符 → 400；把命题复述一遍（归一化包含或三元组 Jaccard ≥0.85）→ 400。插件 `coral_publish` 增加 `falsifier` 参数。存量 103 条 claim 不追溯，缺字段表示"写于 v0.1.29 之前"。
 - **v0.1.28** — §20.10 维护是串行的：新增 `POST /maintenance/lease {author, ttl}` / `POST /maintenance/release` / `GET /maintenance/lease`；`merge`/`retire`/`repin` 必须由租约持有者发起，否则 409。建议节点不受限制——提案可以并行，执行只能一个人。插件的 `coral_suggest` 是唯一的维护形工具，`coral_publish` 不再接受 `type=suggestion`。
 - **v0.1.27** — 建议节点真的被存下来了：`add_node` 之前对 `type=suggestion` 的 `action`/`targets` 直接丢弃（插件一直在发，服务端一直扔，`scan` 里每条建议都是 `action: null`）。现在写入时校验并落盘：`action` 必须是 merge/retire/link/split/reindex 之一，`targets` 必须非空且都存在，否则 400——与 `parents` 同一条理由：打错字必须当场失败，而不是永久落盘。

@@ -142,7 +142,9 @@ def make_handler(corals: dict, read_token: str, write_token: str, default: str |
                     hits, outside = store.find(q.get("q", [""])[0],
                                                root=(q.get("root", [""])[0] or ""),
                                                order=(q.get("sort", ["recent"])[0] or "recent"))
-                    return self._send(200, {"hits": hits, "outside": outside})
+                    from .store import conflicts as _conflicts
+                    return self._send(200, {"hits": hits, "outside": outside,
+                                            "conflicts": _conflicts(hits)})
                 return self._send(404, {"error": "not found"})
             except ValueError as e:  # ?cursor=abc is the caller's fault, not a crash
                 return self._send(400, {"error": str(e)})

@@ -276,6 +276,12 @@ class Derive:
                 sc = scores.get(n["id"], {"score": 0, "votes": 0})
                 m["score"] = sc["score"]
                 m["votes"] = sc["votes"]
+                # §4.1: a proposition nobody has checked is not a weaker belief,
+                # it is an unchecked one. Before this flag the reader had to
+                # infer that from `votes: 0` buried in the payload, so an `open`
+                # claim with no review read exactly like one that had survived a
+                # replication. Say it in the line.
+                m["unreviewed"] = sc["votes"] == 0
                 m["significance"] = n.get("significance", 3)
                 m["dependents"] = deps.get(n["id"], 0)
             table[n["id"]] = m
