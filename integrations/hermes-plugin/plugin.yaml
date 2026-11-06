@@ -15,6 +15,11 @@ provides_tools:
   - coral_tip
   - coral_vote
   - coral_state
+  - coral_claim
+  - coral_release
+  - coral_show
+  - coral_verify
+  - coral_suggest
 provides_hooks: []
 optional_env:
   - name: CORALLIUM_URL
