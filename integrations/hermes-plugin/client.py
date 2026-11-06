@@ -311,7 +311,21 @@ def _line(n: dict) -> str:
     return head + ("  — " + "; ".join(bits) if bits else "")
 
 
+def _setup_hint(coral: str) -> str:
+    """A fresh install has neither a server nor a coral directory. Say which one is
+    missing and the one command that fixes it, instead of a bare "(no hits)"."""
+    d = settings()["corals_dir"] / coral
+    if (d / "nodes").is_dir():
+        return ""
+    return ("[no coral at %s and no server at %s — a fresh install looks like this.\n"
+            " Create one with: bash install.sh --self-hosted]"
+            % (d, settings()["url"]))
+
+
 def _sources(offline: bool, coral: str) -> str:
+    hint = _setup_hint(coral) if offline else ""
+    if hint:
+        return hint
     return ("[offline: scanned %s/nodes]" % coral) if offline else ""
 
 
@@ -444,8 +458,10 @@ def publish(s: str, p: str, o: str, *, coral: str = "", rel: str = "root",
     except PermissionError as e:
         return "PUBLISH FAILED: %s. Nothing was recorded." % e
     except Exception as e:
-        return "PUBLISH FAILED: %s\nNothing was recorded (server at %s unreachable). " \
-               "Say so in your answer instead of assuming it landed." % (e, settings()["url"])
+        hint = _setup_hint(pick_coral(coral))
+        return ("PUBLISH FAILED: %s\nNothing was recorded (server at %s unreachable). "
+                "Say so in your answer instead of assuming it landed.%s"
+                % (e, settings()["url"], ("\n" + hint) if hint else ""))
     node = r.get("node") or {}
     verb = "created" if r.get("created") else "already existed"
     # The id is the first token of the prose line, which is fine for a human and

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install.sh — put Corallium into one of three states.
 #
-#   1) self-hosted   data on this machine (~/corals), server not started
+#   1) self-hosted   data on this machine (~/corals), server started for you
 #   2) remote        url + read token in ~/.hermes/config.yaml, no local data
 #   3) read-only     config written, writes disabled; reads still answer
 #
@@ -17,8 +17,10 @@
 #   bash install.sh --read-only [--remote URL | --self-hosted]
 #   bash install.sh --config PATH       # test against another config file
 #
-# Deliberately does NOT: start the server, enable systemd, git init, or touch
-# anything outside its own config keys (unless --with-service).
+# Deliberately does NOT: git init, enable systemd, or touch anything outside its
+# own config keys — except that self-hosted mode now starts one server process
+# (unless --no-start), because "installed but nothing answers" was the first
+# thing every new user hit.
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,6 +42,7 @@ CORAL_EXPLICIT=0
 READ_ONLY=""
 ALLOW_WRITES=0
 WITH_SERVICE=0
+NO_START=0
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 SCAFFOLD=1
 ASSUME_YES=0
@@ -94,6 +97,7 @@ while [ $# -gt 0 ]; do
     --token-file)  need_val "$1" "${2:-}"; TOKEN_FILE="$2"; shift 2 ;;
     --token-file=*) TOKEN_FILE="${1#*=}"; shift ;;
     --with-service) WITH_SERVICE=1; shift ;;
+    --no-start)    NO_START=1; shift ;;
     --no-scaffold) SCAFFOLD=0; shift ;;
     --dry-run)     DRY_RUN=1; shift ;;
     -y|--yes)      ASSUME_YES=1; shift ;;
@@ -229,8 +233,8 @@ if [ "$MODE" = "self" ]; then
       say "would scaffold coral: $CORALS_DIR/$CORAL"
     else
       step "scaffolding coral '$CORAL'"
-      "$PY" "$SERVER" --init "$CORALS_DIR/$CORAL" --init-name "$CORAL" \
-        --desc "$DESC" --owner "$OWNER" >/dev/null \
+      ( cd "$SELF_DIR" && "$PY" -m corallium --init "$CORALS_DIR/$CORAL" --init-name "$CORAL" \
+          --desc "$DESC" --owner "$OWNER" >/dev/null ) \
         || die "scaffold failed: $CORALS_DIR/$CORAL"
       ok "created $CORALS_DIR/$CORAL (coral.yaml, README.md, .gitignore, nodes/)"
     fi
@@ -648,6 +652,50 @@ PY
   say "    ${DIM}enable with: systemctl --user daemon-reload && systemctl --user enable --now corallium.service${N}"
 fi
 
+# ── start a local server (default; --no-start keeps the old behaviour) ──────
+
+listen_ok() {
+  "$PY" - "$1" "$2" <<'PY'
+import socket, sys
+s = socket.socket(); s.settimeout(0.5)
+sys.exit(0 if s.connect_ex((sys.argv[1], int(sys.argv[2]))) == 0 else 1)
+PY
+}
+
+STARTED=""
+if [ "$MODE" = "self" ] && [ "$NO_START" != "1" ]; then
+  H="$BIND"; [ "$BIND" = "0.0.0.0" ] && H="127.0.0.1"
+  if listen_ok "$H" "$PORT"; then
+    ok "server already listening on $H:$PORT — reusing it (a second one would fight it)"
+  else
+    served=0
+    if [ "$WITH_SERVICE" = "1" ] && command -v systemctl >/dev/null 2>&1; then
+      if systemctl --user enable --now corallium.service >/dev/null 2>&1; then
+        served=1; STARTED="systemd --user unit (systemctl --user stop corallium.service)"
+      fi
+    fi
+    if [ "$served" = "0" ]; then
+      STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/corallium"
+      mkdir -p "$STATE_DIR"
+      step "starting the server on $H:$PORT"
+      ( cd "$SELF_DIR" && setsid nohup "$UNIT_PY" -m corallium \
+          --registry "$CORALS_DIR/registry.yaml" --port "$PORT" --bind "$BIND" \
+          < /dev/null >>"$STATE_DIR/server.log" 2>&1 & echo $! > "$STATE_DIR/server.pid" )
+      n=0
+      while [ "$n" -lt 40 ]; do
+        listen_ok "$H" "$PORT" && break
+        n=$((n+1)); sleep 0.25
+      done
+      if [ "$n" -lt 40 ]; then
+        STARTED="background process, pid $(cat "$STATE_DIR/server.pid" 2>/dev/null), log $STATE_DIR/server.log"
+      else
+        warn "server did not answer on $H:$PORT within 10s — see $STATE_DIR/server.log"
+      fi
+    fi
+    [ -n "$STARTED" ] && ok "server up: $H:$PORT  ($STARTED)"
+  fi
+fi
+
 # ── summary ─────────────────────────────────────────────────────────────────
 
 say ""
@@ -663,8 +711,17 @@ if [ -n "$TOKEN" ]; then say "  read token   stored (hidden)"; else say "  read 
 if [ "$MODE" = "self" ]; then
   say "  registry     $CORALS_DIR/registry.yaml"
   say ""
-  say "${B}Start the server (corallium does not start it for you):${N}"
-  say "  $UNIT_PY $SERVER --registry $CORALS_DIR/registry.yaml --port $PORT --bind $BIND"
+  if [ -n "$STARTED" ]; then
+    say "${B}Server: up.${N}"
+    say "  $STARTED"
+    say "  ${DIM}Stop it with: kill \$(cat ${XDG_STATE_HOME:-$HOME/.local/state}/corallium/server.pid)${N}"
+  elif [ "$NO_START" = "1" ]; then
+    say "${B}Start the server (--no-start was given):${N}"
+    say "  $UNIT_PY $SERVER --registry $CORALS_DIR/registry.yaml --port $PORT --bind $BIND"
+  else
+    say "${B}Start the server:${N}"
+    say "  $UNIT_PY $SERVER --registry $CORALS_DIR/registry.yaml --port $PORT --bind $BIND"
+  fi
   say ""
   say "${DIM}One server per data directory. If something already listens on $BIND:$PORT,"
   say "do not start a second one — point the client at the running instance instead.${N}"
