@@ -968,7 +968,7 @@ corallium/
 ├── store.py      397   Storage：连接、索引重建、租约、写者队列、refs 钉住 — 组装 Store
 ├── derive.py     367   派生：status / score / tip / tasks / claims / reviews
 ├── write.py      281   写入路径：近似度闸门、add_node、claim、reply
-├── maint.py      266   §20 维护：scan / merge / retire / purge / tombstone
+├── maintenance.py 266  §20 维护：scan / merge / retire / purge / tombstone
 ├── http.py       198   HTTP：make_handler（多珊瑚路由、token、UTF-8 查询）
 ├── registry.py    84   coral.yaml、registry.yaml、--init 脚手架、VERSION
 ├── main.py        81   参数、起服务、accept 队列 256
@@ -978,7 +978,7 @@ corallium/
 三条约束：
 
 - **任何模块 < 400 行。** 超过就说明一个模块承担了两件事，按「谁拥有这块状态」再切，不按文件长度硬切。
-- **只有一个写者队列。** 并发契约（§13.10）的全部保证依赖「所有变更走同一条队列、同一个线程」。拆模块不允许拆出第二条写路径——`write.py` / `maint.py` 里的每个变更函数都返回一个 `job(c)` 交给 `self._run`，没有例外。
+- **只有一个写者队列。** 并发契约（§13.10）的全部保证依赖「所有变更走同一条队列、同一个线程」。拆模块不允许拆出第二条写路径——`write.py` / `maintenance.py` 里的每个变更函数都返回一个 `job(c)` 交给 `self._run`，没有例外。
 - **`Store` 由 mixin 组合**（`Storage + Derive + Write + Maint`），所以 `self.` 调用跨模块和跨方法没有区别；换文件不改变任何行为，这也是这次拆分能用同一套 24 条冒烟断言验证的原因。
 
 测试只依赖公开接口（HTTP 端点、`python3 -m corallium` 进程），不 import 内部模块——否则拆分就变成了改测试。启动方式统一走 `tests/_launch.py`，它给子进程设好 `PYTHONPATH`，所以在任何 cwd 下跑测试都是同一条入口。

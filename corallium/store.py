@@ -6,7 +6,7 @@ four mixins so no single file holds the whole server:
     Storage  this module      connection, index, leases, reader queue, refs
     Derive   derive.py        status, score, tip, tasks, votes
     Write    write.py         the write gate, publish, claims, replies
-    Maint    maint.py         scan / merge / retire / purge (PROTOCOL §20)
+    Maintenance  maintenance.py  scan / merge / retire / purge (PROTOCOL §20)
 
 Every mutation runs on one writer thread through one queue: that is the
 concurrency contract in §13.10, not an implementation detail.
@@ -24,7 +24,7 @@ from pathlib import Path
 from queue import Queue
 
 from .derive import Derive
-from .maint import Maint
+from .maintenance import Maint
 from .write import Write
 
 
