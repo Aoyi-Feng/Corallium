@@ -352,7 +352,7 @@ if read_only:
     managed["write_token"] = ""
 
 MODE_NOTE = {
-    "self": "self-hosted: server on this machine, start it yourself",
+    "self": "self-hosted: server on this machine (install.sh starts it unless --no-start)",
     "remote": "remote: data lives on the server, nothing local",
     "readonly": "read-only: writes disabled, reads still answer",
 }
@@ -678,9 +678,10 @@ if [ "$MODE" = "self" ] && [ "$NO_START" != "1" ]; then
       STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/corallium"
       mkdir -p "$STATE_DIR"
       step "starting the server on $H:$PORT"
-      ( cd "$SELF_DIR" && setsid nohup "$UNIT_PY" -m corallium \
+      ( cd "$SELF_DIR" && setsid sh -c 'echo $$ > "$0"; exec "$@"' \
+          "$STATE_DIR/server.pid" "$UNIT_PY" -m corallium \
           --registry "$CORALS_DIR/registry.yaml" --port "$PORT" --bind "$BIND" \
-          < /dev/null >>"$STATE_DIR/server.log" 2>&1 & echo $! > "$STATE_DIR/server.pid" )
+          < /dev/null >>"$STATE_DIR/server.log" 2>&1 & )
       n=0
       while [ "$n" -lt 40 ]; do
         listen_ok "$H" "$PORT" && break
